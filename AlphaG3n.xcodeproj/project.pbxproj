@@ -10,9 +10,22 @@
 		D0AFA3752FC230DF000490E9 /* AlphaG3n.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AlphaG3n.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		CE9491862FC243AC0024820A /* Exceptions for "AlphaG3n" folder in "AlphaG3n" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = D0AFA3742FC230DF000490E9 /* AlphaG3n */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		D0AFA3772FC230DF000490E9 /* AlphaG3n */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				CE9491862FC243AC0024820A /* Exceptions for "AlphaG3n" folder in "AlphaG3n" target */,
+			);
 			path = AlphaG3n;
 			sourceTree = "<group>";
 		};
@@ -248,14 +261,17 @@
 		};
 		D0AFA3812FC230E0000490E9 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = D0AFA3772FC230DF000490E9 /* AlphaG3n */;
+			baseConfigurationReferenceRelativePath = secrets.xcconfig;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = QW64TZKUAF;
+				DEVELOPMENT_TEAM = V4WWNT83G3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = AlphaG3n/Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "AlphaG3n uses the camera to show a live feed and take photos.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -281,14 +297,17 @@
 		};
 		D0AFA3822FC230E0000490E9 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = D0AFA3772FC230DF000490E9 /* AlphaG3n */;
+			baseConfigurationReferenceRelativePath = secrets.xcconfig;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = QW64TZKUAF;
+				DEVELOPMENT_TEAM = V4WWNT83G3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = AlphaG3n/Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "AlphaG3n uses the camera to show a live feed and take photos.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

@@ -47,8 +47,9 @@ nonisolated final class CameraManager:
     private let videoQueue = DispatchQueue(label: "camera.video")
 
 
-    /// Talks to the PaddleOCR job API. The API key lives with the client
-    /// (see `PaddleOCRClient+APIKey.swift`), not here.
+    /// Talks to the PaddleOCR job API. The API key is read from the app
+    /// bundle's Info.plist (populated from `secrets.xcconfig` at build time) —
+    /// see `Secrets.swift`.
     private let paddleClient = PaddleOCRClient.makeDefault()
 
     /// Reused to turn camera pixel buffers into JPEG data.
