@@ -30,6 +30,18 @@ public final class CraftModel {
     public var linkThreshold: Float = 0.4   // affinity pixels above this count as "link"
     public var minArea = 10                 // drop specks smaller than this (in score-map pixels)
 
+    /// OpenAI knobs (passed through to `OpenAIClient`). `imageDetail = .high`
+    /// is best for small text; drop to `.low` to cut cost. `temperature = 0`
+    /// keeps transcription deterministic.
+    public var imageDetail: OpenAIClient.ImageDetail = .high
+    public var temperature: Double = 0
+
+    /// Builds the (system, user) prompt for the OCR call given the box count.
+    /// Override this to prompt-engineer without touching the pipeline, e.g.:
+    ///   craftModel.promptBuilder = { n in (system: "...", user: "... \(n) ...") }
+    public var promptBuilder: (_ boxCount: Int) -> (system: String, user: String)
+        = CraftModel.defaultPrompt
+
     private var model: MLModel?
 
     public init() {}
@@ -45,7 +57,6 @@ public final class CraftModel {
         case pixelBufferFailed
         case missingOutput
         case encodeFailed
-        case openAI(String)
 
         public var errorDescription: String? {
             switch self {
@@ -53,7 +64,6 @@ public final class CraftModel {
             case .pixelBufferFailed:return "Could not build the model input pixel buffer."
             case .missingOutput:    return "CRAFT model did not return region/affinity score maps."
             case .encodeFailed:     return "Could not JPEG-encode the overlay image."
-            case .openAI(let m):    return "OpenAI error: \(m)"
             }
         }
     }
@@ -163,11 +173,15 @@ public final class CraftModel {
 
         var perBox: [Int: String] = [:]
         if !boxes.isEmpty, let jpeg = overlay.jpegData(compressionQuality: 0.9) {
-            let raw = try await requestOpenAIVision(jpeg: jpeg,
-                                                    boxCount: boxes.count,
-                                                    apiKey: apiKey,
-                                                    model: model)
-            perBox = Self.parseNumberedLines(raw)
+            let prompts = promptBuilder(boxes.count)
+            let client = OpenAIClient(apiKey: apiKey,
+                                      model: model,
+                                      temperature: temperature,
+                                      imageDetail: imageDetail)
+            let raw = try await client.vision(system: prompts.system,
+                                              user: prompts.user,
+                                              jpeg: jpeg)
+            perBox = Self.parseResponse(raw)
         }
 
         let pruned = try buildPrunedResult(boxes: boxes, texts: perBox, image: image)
@@ -216,10 +230,36 @@ public final class CraftModel {
         return try JSONDecoder().decode(VirtualDocument.PrunedResult.self, from: data)
     }
 
-    /// Parses "0: HELLO\n1: WORLD" into [0: "HELLO", 1: "WORLD"].
-    private static func parseNumberedLines(_ raw: String) -> [Int: String] {
+    /// Parses the model's reply into [index: text]. Expects a JSON object
+    /// {"0":"...","1":"..."}; tolerates stray code fences, and falls back to
+    /// line format "0: text" if JSON parsing fails.
+    private static func parseResponse(_ raw: String) -> [Int: String] {
+        // Strip ```json fences if the model added them despite instructions.
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("```") {
+            s = s.replacingOccurrences(of: "```json", with: "")
+                 .replacingOccurrences(of: "```", with: "")
+                 .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Primary: JSON object of index -> text.
+        if let data = s.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            var out: [Int: String] = [:]
+            for (k, v) in obj {
+                guard let idx = Int(k) else { continue }
+                if let str = v as? String {
+                    out[idx] = str
+                } else {
+                    out[idx] = String(describing: v)
+                }
+            }
+            if !out.isEmpty { return out }
+        }
+
+        // Fallback: line format "0: text".
         var out: [Int: String] = [:]
-        for line in raw.split(separator: "\n") {
+        for line in s.split(separator: "\n") {
             guard let colon = line.firstIndex(of: ":") else { continue }
             let lhs = line[..<colon].trimmingCharacters(in: .whitespaces)
             let rhs = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
@@ -228,48 +268,44 @@ public final class CraftModel {
         return out
     }
 
-    /// Posts the numbered overlay image to the OpenAI chat-completions endpoint
-    /// and returns the model's "<number>: <text>" lines.
-    private func requestOpenAIVision(jpeg: Data, boxCount: Int,
-                                     apiKey: String, model: String) async throws -> String {
-        let dataURL = "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
-        let prompt = """
-        This image has red numbered boxes drawn around regions of text, numbered \
-        starting at 0 (there are \(boxCount) boxes). Read the text inside each \
-        numbered box exactly. Reply with one line per box in the form \
-        '<number>: <text>'. If a box has no readable text, write '<number>: [none]'.
+    /// Default (system, user) prompt for the numbered-box OCR call. Override
+    /// `promptBuilder` to change wording without editing the pipeline.
+    public static func defaultPrompt(boxCount: Int) -> (system: String, user: String) {
+        let lastIndex = boxCount - 1
+
+        let system = """
+        You are a precise OCR transcription engine. You transcribe only the text \
+        that is visibly printed inside the marked regions of the image. You never \
+        translate, spell-correct, summarize, reorder, complete, or invent text. \
+        You output only the JSON object that is requested — no prose, no code fences.
         """
 
-        let body: [String: Any] = [
-            "model": model,
-            "messages": [[
-                "role": "user",
-                "content": [
-                    ["type": "text", "text": prompt],
-                    ["type": "image_url", "image_url": ["url": dataURL]]
-                ]
-            ]]
-        ]
+        let user = """
+        The image has red rectangular boxes. Each box is tagged with an integer \
+        label (0 through \(lastIndex)) drawn at its top-left corner. Each box marks \
+        one region of text that was detected in the image.
 
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        For every index from 0 to \(lastIndex), transcribe the text inside that box \
+        following these rules exactly:
+        - Reproduce the characters as written: keep original casing, punctuation, \
+        accents/diacritics, digits, and symbols. Do NOT translate or normalize.
+        - The red integer tag is an overlay added by us — it is NOT part of the \
+        text. Ignore it.
+        - Transcribe only what is inside that specific box. Ignore text outside it \
+        and text belonging to other boxes.
+        - A box may contain a single word, a fragment, or a few words — transcribe \
+        exactly what it bounds, partial words included.
+        - If a box contains no legible text, use an empty string "".
+        - If characters are present but unreadable, transcribe your best guess and \
+        wrap the uncertain part in «». Do not drop it.
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let msg = String(data: data, encoding: .utf8) ?? "status \(http.statusCode)"
-            throw CraftError.openAI(msg)
-        }
+        Respond with ONLY a JSON object whose keys are the box indices as strings \
+        and whose values are the transcriptions. Include every index from 0 to \
+        \(lastIndex). No commentary, no markdown, no code fences.
+        Example for 2 boxes: {"0": "Invoice", "1": "Total: $42.00"}
+        """
 
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw CraftError.openAI("Unexpected response shape.")
-        }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (system, user)
     }
 
     // MARK: - Box extraction (port of craft_postprocess.get_boxes)
