@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+
+# Xcode build output
+build/
+DerivedData/
+*.xcuserstate
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Xcode user-specific state (per-developer, never share)
+xcuserdata/
+*.xcuserdatad/
+**/xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+.build/
+
+# CocoaPods (if you ever add them)
+Pods/
+
+# Carthage (if you ever add it)
+Carthage/Build/
+
+# Fastlane (if you ever add it)
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Secrets — anything containing API keys must stay out of the repo.
+# Commit `secrets.example.xcconfig` instead with placeholder values.
+AlphaG3n/secrets.xcconfig
+*.secret.xcconfig
+.env
+.env.*
