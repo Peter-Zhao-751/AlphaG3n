@@ -7,6 +7,8 @@
 
 @preconcurrency import AVFoundation
 import Combine
+import CoreImage
+import UIKit
 
 /// Owns the capture session and feeds the SwiftUI preview, per-frame pixels,
 /// and captured photos.
@@ -44,17 +46,31 @@ nonisolated final class CameraManager:
     /// Dedicated queue on which live frames are delivered.
     private let videoQueue = DispatchQueue(label: "camera.video")
 
+
+    /// Talks to the PaddleOCR job API. The API key lives with the client
+    /// (see `PaddleOCRClient+APIKey.swift`), not here.
+    private let paddleClient = PaddleOCRClient.makeDefault()
+
+    /// Reused to turn camera pixel buffers into JPEG data.
+    private let ciContext = CIContext()
+
     // MARK: - Empty hooks for you to fill in
 
     /// Called on every live frame.
     /// Runs on `videoQueue` (a background thread) — dispatch to main before
     /// touching any UI.
     private func didReceiveFrame(_ pixelBuffer: CVPixelBuffer) {
+        
     }
 
     /// Called once each time the shutter button finishes taking a photo.
     /// Runs on a background thread — dispatch to main before touching any UI.
     private func didCapturePhoto(_ pixelBuffer: CVPixelBuffer) {
+        guard let imageData = jpegData(from: pixelBuffer) else {
+            print("PaddleOCR: failed to encode the captured photo")
+            return
+        }
+        Task { await runOCR(on: imageData) }
     }
 
     // MARK: - Lifecycle
@@ -183,6 +199,53 @@ nonisolated final class CameraManager:
         default:
             completion(false)
         }
+    }
+
+    // MARK: - PaddleOCR upload
+
+    /// Uploads the captured photo to PaddleOCR and prints the extracted output.
+    private func runOCR(on imageData: Data) async {
+        guard PaddleOCRClient.isAPIKeyConfigured else {
+            print("PaddleOCR: set the API key in PaddleOCRClient+APIKey.swift before capturing a photo.")
+            return
+        }
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+        let imageURL = tempDirectory.appendingPathComponent("capture-\(UUID().uuidString).jpg")
+        let outputDirectory = tempDirectory.appendingPathComponent("paddleocr-\(UUID().uuidString)")
+
+        do {
+            try imageData.write(to: imageURL)
+            let pages = try await paddleClient.process(
+                fileURL: imageURL,
+                optionalPayload: OptionalPayload(useDocOrientationClassify: true),
+                outputDirectory: outputDirectory,
+                progress: { event in print("PaddleOCR progress: \(event)") }
+            )
+
+            print("PaddleOCR: extracted \(pages.count) page(s)")
+            for page in pages {
+                print("----- Page \(page.pageIndex) -----")
+                print(page.markdown)
+                if !page.inlineImages.isEmpty {
+                    print("Inline images: \(page.inlineImages)")
+                }
+                if !page.outputImages.isEmpty {
+                    print("Output images: \(page.outputImages)")
+                }
+            }
+        } catch {
+            print("PaddleOCR error: \(error)")
+        }
+    }
+
+    /// Encodes a camera pixel buffer as JPEG data for upload.
+    private func jpegData(from pixelBuffer: CVPixelBuffer) -> Data? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.9)
     }
 
     // MARK: - AVCapture delegate callbacks
