@@ -36,8 +36,21 @@ public struct OptionalPayload: Codable, Sendable {
 public struct ExtractedPage: Sendable {
     public let pageIndex: Int
     public let markdown: String
+    public let blocks: [TextBlock]
     public let inlineImages: [String: URL]
     public let outputImages: [String: URL]
+    /// The full per-page JSON response from the API, kept around so callers can
+    /// inspect any field PaddleOCR returns that we don't decode explicitly.
+    public let rawJSON: String
+}
+
+public struct TextBlock: Sendable {
+    /// PaddleOCR's category for the block (e.g. "text", "title", "table").
+    public let label: String
+    /// `[x1, y1, x2, y2]` in the source image's pixel coordinates.
+    public let bbox: [Double]
+    /// Text content for the block, if PaddleOCR returned one.
+    public let content: String
 }
 
 public enum PaddleOCRError: Error, CustomStringConvertible {
@@ -116,11 +129,25 @@ nonisolated private struct LayoutResult: Decodable {
 nonisolated private struct LayoutParsingResult: Decodable {
     let markdown: MarkdownPayload
     let outputImages: [String: String]?
+    let prunedResult: PrunedResult?
 }
 
 nonisolated private struct MarkdownPayload: Decodable {
     let text: String
     let images: [String: String]
+}
+
+/// Optional everywhere — PaddleOCR's field names are best-effort guesses
+/// (camelCase to match the rest of the API). A missing field just means we
+/// fall back to the raw JSON dump for that page.
+nonisolated private struct PrunedResult: Decodable {
+    let parsingResList: [ParsingResultBlock]?
+}
+
+nonisolated private struct ParsingResultBlock: Decodable {
+    let blockLabel: String?
+    let blockBbox: [Double]?
+    let blockContent: String?
 }
 
 // MARK: - Multipart helper (plain struct; not an actor)
@@ -381,6 +408,7 @@ public actor PaddleOCRClient {
                 let page = try await writePage(
                     pageIndex: pageIndex,
                     parsing: parsing,
+                    rawJSON: line,
                     outputDirectory: outputDirectory
                 )
                 pages.append(page)
@@ -394,6 +422,7 @@ public actor PaddleOCRClient {
     private func writePage(
         pageIndex: Int,
         parsing: LayoutParsingResult,
+        rawJSON: String,
         outputDirectory: URL
     ) async throws -> ExtractedPage {
         let mdURL = outputDirectory.appendingPathComponent("doc_\(pageIndex).md")
@@ -412,11 +441,18 @@ public actor PaddleOCRClient {
         let inlineResults = try await downloadConcurrently(specs: inlineSpecs)
         let outputResults = try await downloadConcurrently(specs: outputSpecs)
 
+        let blocks: [TextBlock] = (parsing.prunedResult?.parsingResList ?? []).compactMap { raw in
+            guard let label = raw.blockLabel, let bbox = raw.blockBbox else { return nil }
+            return TextBlock(label: label, bbox: bbox, content: raw.blockContent ?? "")
+        }
+
         return ExtractedPage(
             pageIndex: pageIndex,
             markdown: parsing.markdown.text,
+            blocks: blocks,
             inlineImages: inlineResults,
-            outputImages: outputResults
+            outputImages: outputResults,
+            rawJSON: rawJSON
         )
     }
 

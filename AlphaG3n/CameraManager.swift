@@ -227,7 +227,23 @@ nonisolated final class CameraManager:
             print("PaddleOCR: extracted \(pages.count) page(s)")
             for page in pages {
                 print("----- Page \(page.pageIndex) -----")
-                print(page.markdown)
+                if page.blocks.isEmpty {
+                    // We didn't recognize any bbox blocks in the response;
+                    // dump the raw JSON so the schema can be inspected and the
+                    // decoder in PaddleOCRModel.swift refined.
+                    print("No decoded blocks. Raw JSON:")
+                    print(page.rawJSON)
+                } else {
+                    for block in page.blocks {
+                        let bbox = block.bbox
+                            .map { String(format: "%.1f", $0) }
+                            .joined(separator: ", ")
+                        print("[\(block.label)] bbox=[\(bbox)]")
+                        if !block.content.isEmpty {
+                            print(block.content)
+                        }
+                    }
+                }
                 if !page.inlineImages.isEmpty {
                     print("Inline images: \(page.inlineImages)")
                 }
