@@ -75,6 +75,16 @@ public final class CraftModel {
     public func detect(in image: UIImage) throws -> [Box] {
         let model = try loadModel()
 
+        // CRAFT reads pixels straight off `cgImage`, which ignores
+        // `imageOrientation`. A portrait iPhone capture is tagged `.right`, so
+        // its `cgImage` is the sideways sensor bitmap while `size` is the upright
+        // logical size — makePixelBuffer would then feed the model a squashed,
+        // sideways image, and the boxes would come back rotated 90° from anything
+        // drawn with orientation honored (`renderNumbered`, the on-screen result).
+        // Bake the orientation into the pixels so the model input, the box
+        // mapping, and the caller's overlay all share one upright frame.
+        let image = Self.uprightImage(image)
+
         guard let prepared = Self.makePixelBuffer(from: image, size: Self.inputSize) else {
             throw CraftError.pixelBufferFailed
         }
@@ -104,11 +114,20 @@ public final class CraftModel {
         let bounds = CGRect(origin: .zero, size: image.size)
 
         let mapped = rawBoxes.compactMap { r -> CGRect? in
-            let rect = CGRect(
+            let scaled = CGRect(
                 x: r.minX * imagePerScoreMapPixel,
                 y: r.minY * imagePerScoreMapPixel,
                 width:  r.width  * imagePerScoreMapPixel,
                 height: r.height * imagePerScoreMapPixel
+            )
+            // The score map comes back mirrored top-to-bottom relative to the
+            // upright overlay, so boxes render upside down. Flip each box across
+            // the image's horizontal axis (Y mirror) to land it on the text.
+            let rect = CGRect(
+                x: scaled.minX,
+                y: image.size.height - scaled.maxY,
+                width: scaled.width,
+                height: scaled.height
             ).intersection(bounds)
             return (rect.isNull || rect.isEmpty) ? nil : rect
         }
@@ -391,6 +410,22 @@ public final class CraftModel {
         let m = try MLModel(contentsOf: url, configuration: config)
         self.model = m
         return m
+    }
+
+    /// Returns an `.up`-oriented copy, redrawing the pixels so `cgImage` matches
+    /// the logical `size`. No-op when the image is already `.up`. CRAFT consumes
+    /// `cgImage` directly, so an orientation-tagged image (a portrait capture is
+    /// `.right`) must be normalized here or detection runs on the raw sideways,
+    /// aspect-distorted bitmap.
+    private static func uprightImage(_ image: UIImage) -> UIImage {
+        guard image.imageOrientation != .up else { return image }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1   // 1:1 point→pixel so makePixelBuffer's size math holds.
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }
     }
 
     /// Reads an MLMultiArray into a flat [Float] regardless of its dtype.

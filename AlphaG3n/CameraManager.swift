@@ -193,6 +193,15 @@ nonisolated final class CameraManager:
         let snapshot = latestDetections
         detectionsLock.unlock()
 
+        // Sensor-native quad coords (the videoOutput is intentionally not
+        // rotated) line up with the sensor-native pixel buffer below, so the
+        // perspective-correction math stays simple; the user-facing
+        // orientation is applied via the UIImage tag at encode time.
+        rotationLock.lock()
+        let angle = _sessionRotationAngle
+        rotationLock.unlock()
+        let orientation = Self.uiImageOrientation(forVideoRotationAngle: angle)
+
         let winner = TrackedBox.highlightWinner(in: snapshot)
         let paddedQuad: Quad? = winner.map { box in
             let raw = box.normalizedQuad ?? Quad(rect: box.normalizedRect)
@@ -202,9 +211,9 @@ nonisolated final class CameraManager:
 
         let imageData: Data? = {
             if let quad = paddedQuad {
-                return jpegData(from: pixelBuffer, perspectiveCorrectingTo: quad)
+                return jpegData(from: pixelBuffer, perspectiveCorrectingTo: quad, orientation: orientation)
             }
-            return jpegData(from: pixelBuffer)
+            return jpegData(from: pixelBuffer, orientation: orientation)
         }()
 
         guard let imageData else {
@@ -539,22 +548,46 @@ nonisolated final class CameraManager:
         }
     }
 
-    /// Stamp the current rotation angle onto the photo and video output
-    /// connections. Runs on `sessionQueue` (called from session-config code
-    /// paths and from the orientation observer's queue hop), so it's safe
-    /// to mutate the connections directly.
+    /// Stamp the current rotation angle onto the photo output's connection so
+    /// `photo.metadata` (and `fileDataRepresentation()`, if anything starts
+    /// using it) carry the correct EXIF orientation tag at capture time.
+    ///
+    /// Intentionally *not* applied to the video data output: rotating that
+    /// connection rotates the buffer pixels delivered to the detector, but
+    /// the metadata-output coord system that the preview overlay's
+    /// `layerRectConverted(fromMetadataOutputRect:)` reads is fixed to the
+    /// sensor's natural orientation — so a rotated detector frame produces
+    /// overlays that drift in the rotation direction. Keep the live frame in
+    /// sensor-native and let the preview layer's own connection handle
+    /// display rotation; the captured photo gets its upright orientation
+    /// baked into the JPEG at encode time (see `uiImageOrientation(for:)`).
     private func applyRotationAngleToConnections() {
         rotationLock.lock()
         let angle = _sessionRotationAngle
         rotationLock.unlock()
 
-        for connection in [photoOutput.connection(with: .video),
-                           videoOutput.connection(with: .video)] {
-            guard let connection else { continue }
-            if connection.isVideoRotationAngleSupported(angle),
-               connection.videoRotationAngle != angle {
-                connection.videoRotationAngle = angle
-            }
+        guard let connection = photoOutput.connection(with: .video) else { return }
+        if connection.isVideoRotationAngleSupported(angle),
+           connection.videoRotationAngle != angle {
+            connection.videoRotationAngle = angle
+        }
+    }
+
+    /// Map a `videoRotationAngle` (the AVFoundation convention) to the
+    /// `UIImage.Orientation` that, when stamped on a UIImage holding sensor-
+    /// native pixels, renders / encodes the image upright for the user.
+    ///
+    /// `photo.pixelBuffer` is *always* delivered in the sensor's natural
+    /// landscape orientation regardless of the photo output connection's
+    /// rotation, so we have to apply the rotation ourselves — either by
+    /// rotating pixels (expensive) or by tagging the UIImage with the
+    /// correct orientation (free, and JPEG encoding carries it as EXIF).
+    private static func uiImageOrientation(forVideoRotationAngle angle: CGFloat) -> UIImage.Orientation {
+        switch Int(angle.rounded()) {
+        case 90:  return .right   // device portrait → rotate pixels 90° CW on display
+        case 180: return .down    // device landscape-right → 180°
+        case 270: return .left    // device portrait upside down → 90° CCW
+        default:  return .up      // device landscape-left (sensor native)
         }
     }
 
@@ -581,58 +614,96 @@ nonisolated final class CameraManager:
     ///   1. Pre-shrink the photo to fit `maxPixels` and bake any EXIF
     ///      rotation into the pixels. This cuts upload bytes 70-80% on a
     ///      12 MP iPhone capture and removes server-side downsample work.
-    ///   2. Submit to PaddleOCR. With orient + unwarp on, Baidu may rotate
-    ///      / dewarp internally; the response's `preprocessedImageURL`
+    ///   2. Submit to PaddleOCR (Baidu). With orient + unwarp on, Baidu may
+    ///      rotate / dewarp internally; the response's `preprocessedImageURL`
     ///      points at the canonical post-transform image.
-    ///   3. Once Baidu responds, run CRAFT on that *same* preprocessed
-    ///      image so the augmentation overlap math is coordinate-correct.
-    ///      CRAFT can't run in parallel with Baidu when preprocessing is
-    ///      on — the coordinate frames would diverge — so we accept the
-    ///      ~100-500 ms serial cost in exchange for correctness.
-    ///   4. Render the merged layout on the preprocessed image (its size
-    ///      matches `pruned.width × pruned.height`, so no rescale at draw).
-    /// CRAFT-only capture path. Runs the on-device CRAFT detector on the
-    /// captured photo and shows its numbered text-region boxes. No PaddleOCR
-    /// (Baidu) request and no layout merge — CRAFT detects regions but does
-    /// not transcribe, so the overlay is boxes only, not recognized text.
-    ///
-    /// Because nothing leaves the device, this path needs no API key; the
-    /// `apiKeyConfigured` gate and the whole `prepareForUpload`/`paddleClient`
-    /// /`augment` machinery above are unused while the button runs CRAFT only.
+    ///   3. Once Baidu responds, run CRAFT on that *same* preprocessed image
+    ///      so the augmentation overlap math is coordinate-correct. CRAFT can't
+    ///      run in parallel with Baidu when preprocessing is on — the coordinate
+    ///      frames would diverge — so we accept the ~100-500 ms serial cost in
+    ///      exchange for correctness. CRAFT now normalizes orientation and flips
+    ///      its boxes upright internally, so its boxes land in Baidu's top-left
+    ///      frame and the overlap filter compares like with like.
+    ///   4. Merge the CRAFT survivors into Baidu's layout and render on the
+    ///      preprocessed image (its size matches `pruned.width × pruned.height`,
+    ///      so no rescale at draw).
     private func runOCR(on rawJPEG: Data) async {
-        guard let image = UIImage(data: rawJPEG) else {
+        guard apiKeyConfigured else {
+            await publishFailure("Set the PaddleOCR API key in secrets.xcconfig before capturing.")
+            return
+        }
+
+        let optional = OptionalPayload()
+        guard let prepared = Self.prepareForUpload(
+            rawJPEG,
+            maxPixels: optional.maxPixels,
+            quality: Self.uploadJPEGQuality
+        ) else {
             await publishFailure("Failed to decode the captured photo.")
             return
         }
 
-        // Detection + overlay drawing are CPU / Neural-Engine work; run them
-        // off the caller's task so this returns promptly.
-        let overlay = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-            let craft = CraftModel()
-            do {
-                let boxes = try craft.detect(in: image)
-                print("CRAFT detected \(boxes.count) box(es)")
-                return craft.renderNumbered(boxes, on: image)
-            } catch {
-                print("CRAFT detection failed: \(error)")
-                return nil
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paddleocr-\(UUID().uuidString)", isDirectory: true)
+        let filename = "capture-\(UUID().uuidString).jpg"
+
+        do {
+            let pages = try await paddleClient.process(
+                imageData: prepared.jpeg,
+                filename: filename,
+                mimeType: "image/jpeg",
+                optionalPayload: optional,
+                outputDirectory: outputDirectory
+            )
+
+            // The user may have hit Cancel while the upload was in flight; bail
+            // before touching captureState so the abandoned read can't pop a
+            // result over the now-live camera.
+            guard !Task.isCancelled else { return }
+
+            guard let page = pages.first else {
+                await publishFailure("PaddleOCR returned no pages.")
+                return
             }
-        }.value
+            guard let pruned = page.prunedResult else {
+                await publishFailure("PaddleOCR response was missing layout data.")
+                return
+            }
 
-        // The user may have hit Cancel while CRAFT was running. Bail before
-        // touching captureState so the abandoned read can't pop a result or
-        // error over the now-live camera.
-        guard !Task.isCancelled else { return }
+            // CRAFT consumes the same image Baidu's bboxes describe so the
+            // overlap filter compares apples to apples. The preprocessed URL is
+            // the post-orientation, post-dewarp image; if it's absent (server
+            // skipped preprocessing for this page) we fall back to the upright
+            // bytes we sent.
+            let craftSource = Self.loadCraftSource(
+                preprocessedURL: page.preprocessedImageURL,
+                fallback: prepared.image
+            )
+            let craftBoxes = await Self.detectCraftBoxes(in: craftSource)
+            let augmented = Self.augment(pruned: pruned, with: craftBoxes)
+            let renderSource = craftSource
 
-        guard let overlay else {
-            await publishFailure("CRAFT detection failed — is CRAFT.mlpackage in the target?")
-            return
-        }
+            // Document build + render is pure CPU work; offload so this method
+            // returns to its caller as fast as possible. On dense pages this is
+            // 50-200 ms of layout sort + path drawing that would otherwise stall
+            // the publish step.
+            let overlay = await Task.detached(priority: .userInitiated) { () -> UIImage in
+                let document = VirtualDocument.make(from: augmented, image: renderSource)
+                return document.render()
+            }.value
 
-        await MainActor.run {
-            self.captureState = .result(overlay)
-            self.stop()
-            self.ocrTask = nil
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                self.captureState = .result(overlay)
+                self.stop()
+                self.ocrTask = nil
+            }
+        } catch {
+            // A cancelled upload surfaces as a thrown error; don't pop it over
+            // the camera the user has already returned to.
+            guard !Task.isCancelled else { return }
+            await publishFailure("PaddleOCR error: \(error)")
         }
     }
 
@@ -753,13 +824,19 @@ nonisolated final class CameraManager:
         captureState = .failed(message)
     }
 
-    /// Encodes a camera pixel buffer as JPEG data for upload.
-    private func jpegData(from pixelBuffer: CVPixelBuffer) -> Data? {
+    /// Encodes a camera pixel buffer as JPEG data for upload. `orientation`
+    /// is stamped on the wrapping `UIImage` so the JPEG carries the matching
+    /// EXIF orientation tag — downstream consumers (`UIImage(data:)`, image
+    /// viewers, the OCR server) then display / interpret the bytes upright
+    /// without us having to physically rotate the pixels here.
+    private func jpegData(from pixelBuffer: CVPixelBuffer,
+                          orientation: UIImage.Orientation) -> Data? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
             return nil
         }
-        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.9)
+        return UIImage(cgImage: cgImage, scale: 1, orientation: orientation)
+            .jpegData(compressionQuality: 0.9)
     }
 
     /// Crops + perspective-corrects the pixel buffer to the given Vision-normalized
@@ -772,7 +849,8 @@ nonisolated final class CameraManager:
     /// (bottom-left origin) so the filter receives a correctly-oriented quad
     /// regardless of which corner the detector listed first.
     private func jpegData(from pixelBuffer: CVPixelBuffer,
-                          perspectiveCorrectingTo quad: Quad) -> Data? {
+                          perspectiveCorrectingTo quad: Quad,
+                          orientation: UIImage.Orientation) -> Data? {
         let baseImage = CIImage(cvPixelBuffer: pixelBuffer)
         let extent = baseImage.extent
         // Clamp to the input extent so a class with generous padding that
@@ -798,11 +876,11 @@ nonisolated final class CameraManager:
               let br = diffs.indices.max(by: { diffs[$0] < diffs[$1] }),
               Set([bl, tr, tl, br]).count == 4 else {
             // Degenerate quad — fall back to a plain encode of the full frame.
-            return jpegData(from: pixelBuffer)
+            return jpegData(from: pixelBuffer, orientation: orientation)
         }
 
         guard let filter = CIFilter(name: "CIPerspectiveCorrection") else {
-            return jpegData(from: pixelBuffer)
+            return jpegData(from: pixelBuffer, orientation: orientation)
         }
         filter.setValue(ciImage, forKey: kCIInputImageKey)
         filter.setValue(CIVector(cgPoint: pixelPoints[tl]), forKey: "inputTopLeft")
@@ -814,7 +892,8 @@ nonisolated final class CameraManager:
               let cgImage = ciContext.createCGImage(output, from: output.extent) else {
             return nil
         }
-        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.9)
+        return UIImage(cgImage: cgImage, scale: 1, orientation: orientation)
+            .jpegData(compressionQuality: 0.9)
     }
 
     // MARK: - AVCapture delegate callbacks

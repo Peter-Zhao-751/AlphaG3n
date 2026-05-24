@@ -165,15 +165,16 @@ private struct FailureOverlay: View {
 
 // MARK: - Accessible top action bar
 
-/// A full-width, edge-to-edge button pinned to the top of an overlay. Sized as
-/// a large tap target and wired for VoiceOver so a blind user can reliably find
-/// and trigger it without aiming. Shared by the processing, result, and failure
-/// overlays so the primary action sits in the same place on every screen.
+/// A rounded, pill-shaped button that floats near the top of an overlay — just
+/// below the Dynamic Island and inset from the screen edges. Long and thin so
+/// it reads as an ordinary button, but still a wide, easy tap target wired for
+/// VoiceOver. Shared by the processing, result, and failure overlays so the
+/// primary action sits in the same place on every screen.
 private struct TopActionBar: View {
     let title: String
     /// Leading SF Symbol. Defaults to the familiar close glyph.
     var systemImage: String = "xmark"
-    /// Bar fill. Cosmetic only — VoiceOver never reads color.
+    /// Button fill. Cosmetic only — VoiceOver never reads color.
     var tint: Color = .accentColor
     /// Spoken description of what tapping does.
     var accessibilityHint: String
@@ -183,11 +184,12 @@ private struct TopActionBar: View {
         VStack(spacing: 0) {
             Button(action: action) {
                 Label(title, systemImage: systemImage)
-                    .font(.title2.weight(.bold))
+                    .font(.headline)
                     .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity, minHeight: 64)
-                    .background(tint)
+                    .frame(maxWidth: .infinity, minHeight: 50)
+                    .background(tint, in: Capsule())
                     .contentShape(Rectangle())
+                    .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(title)
@@ -198,7 +200,10 @@ private struct TopActionBar: View {
 
             Spacer()
         }
-        .ignoresSafeArea(edges: .horizontal)
+        // Inset from the edges and nudged down so the pill sits just under the
+        // Dynamic Island rather than running to the top/side edges.
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
     }
 }
 
