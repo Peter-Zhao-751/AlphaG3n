@@ -192,9 +192,14 @@ public final class CraftModel {
             .map { "\($0.index): \(perBox[$0.index] ?? "")" }
             .joined(separator: "\n")
 
+        let blocks: [TextBlock] = pruned.parsingResList.map { raw in
+            TextBlock(label: raw.blockLabel, bbox: raw.blockBbox, content: raw.blockContent)
+        }
+
         let page = ExtractedPage(
             pageIndex: 0,
             markdown: markdown,
+            blocks: blocks,
             inlineImages: [:],
             outputImages: [:],
             prunedResult: pruned,
