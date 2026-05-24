@@ -54,21 +54,27 @@ struct CameraPreview: UIViewRepresentable {
             let l = CAShapeLayer()
             l.fillColor = nil
             l.strokeColor = UIColor(LarpTheme.orange).cgColor
-            // Match the result-view detection boxes: same orange, the same 2pt
-            // weight, and crisp (mitered) corners instead of rounded ones.
-            l.lineWidth = 2
+            // Match the result-view detection boxes: same orange and crisp
+            // (mitered) corners, a touch bolder than their 2pt so the brackets
+            // stay legible over the moving live feed.
+            l.lineWidth = 3
             l.lineCap = .butt
             l.lineJoin = .miter
             return l
         }()
-        /// The crosshair brackets trace a box this much larger than the tracked
-        /// region, so the corners sit outside the content with a clear margin.
-        /// 0.10 → the traced box is 10% larger (≈5% added on each side).
-        private let crosshairBoxMargin: CGFloat = 0.10
+        /// Translucent accent fill of the region the brackets frame, sitting
+        /// beneath `highlightLayer`. Same orange as the brackets, at low alpha.
+        private let fillLayer: CAShapeLayer = {
+            let l = CAShapeLayer()
+            l.strokeColor = nil
+            l.fillColor = UIColor(LarpTheme.orange).withAlphaComponent(0.4).cgColor
+            return l
+        }()
         private var lastDetections: [TrackedBox] = []
 
         override init(frame: CGRect) {
             super.init(frame: frame)
+            layer.addSublayer(fillLayer)      // beneath the brackets
             layer.addSublayer(highlightLayer)
         }
 
@@ -76,6 +82,7 @@ struct CameraPreview: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
+            fillLayer.frame = bounds
             highlightLayer.frame = bounds
             rebuildPath()
         }
@@ -102,14 +109,20 @@ struct CameraPreview: UIViewRepresentable {
             // Pick the single largest qualifying box (if any) for the accent
             // highlight. Other tracked boxes stay tracked but are not rendered.
             let winnerIdx = pickHighlightIndex(lastDetections)
-            let highlight = UIBezierPath()
+            let crosshair = UIBezierPath()
+            let fill = UIBezierPath()
             if let winnerIdx {
-                highlight.append(cornerCrosshairPath(for: lastDetections[winnerIdx]))
+                // Brackets and the translucent fill share the same expanded
+                // corners, so the fill exactly covers the framed region.
+                let corners = crosshairCornerPoints(for: lastDetections[winnerIdx])
+                crosshair.append(cornerCrosshairPath(points: corners))
+                fill.append(quadPath(points: corners))
             }
             // Avoid the implicit animation on `path` so the boxes track frames cleanly.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            highlightLayer.path = highlight.cgPath
+            highlightLayer.path = crosshair.cgPath
+            fillLayer.path = fill.cgPath
             CATransaction.commit()
         }
 
@@ -141,11 +154,27 @@ struct CameraPreview: UIViewRepresentable {
             )
         }
 
-        private func cornerCrosshairPath(for detection: TrackedBox) -> UIBezierPath {
+        /// The expanded quad's four corners in view space — the region the
+        /// crosshair brackets frame and the fill covers.
+        private func crosshairCornerPoints(for detection: TrackedBox) -> [CGPoint] {
+            // Trace the same region capture will crop: grow the quad by this
+            // class's crop padding (YoloEClasses), so the brackets preview the
+            // actual crop and looser-cropped classes (e.g. bottle, can) read
+            // wider. Unknown/nil ids fall back to the table's default padding.
+            let margin = YoloEClasses.cropPadding(for: detection.classId)
             let quad = (detection.normalizedQuad ?? Quad(rect: detection.normalizedRect))
-                .expanded(byFactor: crosshairBoxMargin)
-            let viewPoints = quad.points.map(viewPoint(fromVisionPoint:))
-            return cornerCrosshairPath(points: viewPoints)
+                .expanded(byFactor: margin)
+            return quad.points.map(viewPoint(fromVisionPoint:))
+        }
+
+        /// Closed polygon through `points` — the filled region inside the brackets.
+        private func quadPath(points: [CGPoint]) -> UIBezierPath {
+            let path = UIBezierPath()
+            guard points.count == 4 else { return path }
+            path.move(to: points[0])
+            for i in 1..<4 { path.addLine(to: points[i]) }
+            path.close()
+            return path
         }
 
         private func cornerCrosshairPath(points: [CGPoint]) -> UIBezierPath {

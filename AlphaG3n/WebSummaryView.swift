@@ -22,6 +22,10 @@ struct WebSummaryView: View {
     /// Drives VoiceOver onto the progress status the moment the cover opens, so
     /// a blind user hears "Summarizing…" instead of the Back bar (see `loadingView`).
     @AccessibilityFocusState private var loadingFocused: Bool
+    /// Drives VoiceOver onto the website-name hero once the summary arrives, so a
+    /// blind user hears which site this is before swiping into its sentences —
+    /// again instead of the Back bar (see the `.loaded` case).
+    @AccessibilityFocusState private var summaryFocused: Bool
 
     private var host: String { url.host ?? "the linked website" }
 
@@ -54,7 +58,18 @@ struct WebSummaryView: View {
             let sentences = split.isEmpty ? [summary] : split
             VStack(spacing: 0) {
                 ReaderHero(tagline: "Website", title: host, subtitle: "summary")
+                    .accessibilityFocused($summaryFocused)
+                // The list leaves its own appear-focus off (the default) so it
+                // doesn't fight the hero above for VoiceOver; the user swipes
+                // down into the sentences from there.
                 SentenceListView(sentences: sentences, accent: LarpTheme.orange)
+            }
+            .onAppear {
+                // Mirror the loading focus: once the summary swaps in, pull
+                // VoiceOver onto the website-name hero rather than the Back bar.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    summaryFocused = true
+                }
             }
 
         case .failed(let message):

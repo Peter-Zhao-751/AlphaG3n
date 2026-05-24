@@ -93,6 +93,12 @@ private struct CameraControls: View {
     var onClose: () -> Void
     var onCapture: () -> Void
 
+    /// Pulls VoiceOver onto the Capture button whenever the live viewfinder
+    /// appears — most importantly when returning here from the analysis screen
+    /// (a state-driven swap that otherwise leaves focus stranded), but also on
+    /// first entry, where Capture is the screen's primary action.
+    @AccessibilityFocusState private var captureFocused: Bool
+
     var body: some View {
         ZStack {
             //CameraReticle()
@@ -103,6 +109,7 @@ private struct CameraControls: View {
                         systemImage: "xmark",
                         accessibilityLabel: "Close camera",
                         accessibilityHint: "Returns to the home screen",
+                        scale: 1.5,
                         action: onClose
                     )
                     Spacer()
@@ -115,9 +122,18 @@ private struct CameraControls: View {
                 VStack(spacing: 22) {
                     LarpHintLine(text: "Hold still — auto-detecting layout")
                     LarpCaptureBar(action: onCapture)
+                        .accessibilityFocused($captureFocused)
                 }
                 .padding(.horizontal, 28)
                 .padding(.bottom, 44)
+            }
+        }
+        // The brief delay lets the swap from the analysis screen settle so
+        // VoiceOver doesn't re-home onto the Close button (top-left) after we
+        // move focus — the same timing the reader/summary screens use.
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                captureFocused = true
             }
         }
     }

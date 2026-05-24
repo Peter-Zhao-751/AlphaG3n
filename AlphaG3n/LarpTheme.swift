@@ -97,22 +97,25 @@ struct PixelCorners: View {
 
 /// The small rounded, blurred-background icon button used in the camera top
 /// bar (e.g. the close X). 44pt so it's a comfortable VoiceOver target even
-/// though the mockup draws it at 40.
+/// though the mockup draws it at 40. `scale` multiplies the whole tile (glyph,
+/// frame and corner) together so callers can size it up without distortion.
 struct LarpIconButton: View {
     var systemImage: String
     var accessibilityLabel: String
     var accessibilityHint: String
+    /// Multiplier on the base 44pt tile; 1 is the default size.
+    var scale: CGFloat = 1
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 17 * scale, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+                .frame(width: 44 * scale, height: 44 * scale)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12 * scale))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
+                    RoundedRectangle(cornerRadius: 12 * scale)
                         .stroke(.white.opacity(0.08), lineWidth: 1)
                 )
                 .contentShape(Rectangle())

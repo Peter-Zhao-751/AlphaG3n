@@ -245,9 +245,14 @@ public struct OpenAIClient: Sendable {
     • readable — legible, meaningful text. Put it in `text` as flowing prose: \
     merge lines that belong to the same sentence or paragraph, and do NOT break \
     text apart just because it wrapped onto separate lines in the image. Keep \
-    real paragraph breaks only. Leave `note` empty.
+    real paragraph breaks only. When a word or character is hard to make out, \
+    transcribe your best guess — never write "[unclear]", "?", "...", brackets, \
+    or any note about uncertainty. Just commit to the most likely reading. \
+    Leave `note` empty.
     • empty — no text at all. Leave `text` empty; in `note`, briefly say no text was found.
-    • unreadable — text present but too blurry, dark, or small to read. Leave `text` and `note` empty.
+    • unreadable — text present but too blurry, dark, or small to even guess at. \
+    Use this ONLY when you are not confident enough to guess; if you can guess, \
+    stay readable. Leave `text` and `note` empty.
     • irrelevant — not real text to read aloud (keyboard, buttons, logos, labels). \
     Leave `text` empty; in `note`, briefly say what the image shows.
 

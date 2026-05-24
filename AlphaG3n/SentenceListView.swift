@@ -26,12 +26,32 @@ struct SentenceListView: View {
     /// card shows — the tapped box already spoke that one line, so the list would
     /// just repeat it. The website summary passes nil (no type, always listed).
     var typeFooter: String? = nil
+    /// When true, VoiceOver focus is pulled onto the first listed element as the
+    /// view appears — the first sentence, or the block-type card when a
+    /// single-sentence block has collapsed to just that. Off by default: the
+    /// website summary leaves it off because its caller focuses the website-name
+    /// hero sitting above this list instead.
+    var focusOnAppear: Bool = false
+
+    /// Drives the appear-time VoiceOver focus (see `focusOnAppear`). Bound to
+    /// every sentence card and the type-footer card so either can be the anchor.
+    @AccessibilityFocusState private var focusedAnchor: FocusAnchor?
+
+    private enum FocusAnchor: Hashable {
+        case sentence(Int)
+        case footer
+    }
+
+    /// Whether the per-sentence cards are listed. A single-sentence typed block
+    /// collapses to just its type card; the website summary (no typeFooter)
+    /// always lists its sentence(s), even when there's only one.
+    private var listsSentences: Bool { typeFooter == nil || sentences.count > 1 }
+
+    /// The type-footer card is the first focus anchor only when no sentence
+    /// cards sit above it (i.e. the collapsed single-sentence block).
+    private var firstAnchorIsFooter: Bool { !(listsSentences && !sentences.isEmpty) }
 
     var body: some View {
-        // A single-sentence block adds nothing in the per-sentence list, so we
-        // collapse to just its type card. The website summary (no typeFooter)
-        // always lists its sentence(s), even when there's only one.
-        let listsSentences = typeFooter == nil || sentences.count > 1
         VStack(spacing: 0) {
             if listsSentences { listHead }
             ScrollView {
@@ -39,15 +59,27 @@ struct SentenceListView: View {
                     if listsSentences {
                         ForEach(Array(sentences.enumerated()), id: \.offset) { index, sentence in
                             card(index: index, sentence: sentence)
+                                .accessibilityFocused($focusedAnchor, equals: .sentence(index))
                         }
                     }
                     if let typeFooter {
                         typeFooterCard(typeFooter)
+                            .accessibilityFocused($focusedAnchor, equals: .footer)
                     }
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, listsSentences ? 4 : 12)
                 .padding(.bottom, 40)
+            }
+        }
+        // VoiceOver otherwise lands on the Back bar above (it carries a higher
+        // sort priority); pull focus onto the first sentence (or the type card,
+        // for a collapsed single-sentence block) instead. The brief delay lets
+        // the cover settle first — the same timing the website summary uses.
+        .onAppear {
+            guard focusOnAppear else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                focusedAnchor = firstAnchorIsFooter ? .footer : .sentence(0)
             }
         }
     }

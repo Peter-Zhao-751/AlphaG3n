@@ -485,8 +485,11 @@ struct ChunkDetailScreen: View {
                 )
                 // The block type ("Title" / "Text" …) rides at the BOTTOM of the
                 // list, after every sentence, so a blind user reads the block
-                // then learns what kind of block it was.
-                SentenceListView(sentences: sentences, accent: accent, typeFooter: title)
+                // then learns what kind of block it was. `focusOnAppear` lands
+                // VoiceOver on the first sentence (or the type card, when a
+                // single-sentence block collapses to just it) rather than the
+                // Back bar above.
+                SentenceListView(sentences: sentences, accent: accent, typeFooter: title, focusOnAppear: true)
             }
         }
     }
