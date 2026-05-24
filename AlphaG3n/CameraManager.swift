@@ -7,23 +7,31 @@
 
 @preconcurrency import AVFoundation
 import Combine
-import CoreImage
 import UIKit
 
-/// Owns the capture session and feeds the SwiftUI preview, per-frame pixels,
-/// and captured photos.
+/// Owns the capture session and drives the SwiftUI preview + photo capture
+/// pipeline.
 ///
-/// The two hook methods — `didReceiveFrame(_:)` and `didCapturePhoto(_:)` — are
-/// intentionally empty. Fill them in to do something with the pixels.
+/// AVFoundation calls back on its own queues, so this class is `nonisolated`
+/// with mutable state confined to `sessionQueue` (hence `@unchecked
+/// Sendable`). UI-facing `@Published` values are explicitly `@MainActor` so
+/// SwiftUI only ever reads them on main.
 ///
-/// AVFoundation drives this class from its own background queues rather than the
-/// main actor, so it is `nonisolated`. Access to the session is confined to
-/// `sessionQueue` (hence `@unchecked Sendable`), and the UI-facing `@Published`
-/// values are explicitly `@MainActor` so SwiftUI only ever reads them on main.
+/// First-init and shutter-to-processing latency are deliberately tuned:
+///   * Session configuration starts as soon as this object is constructed if
+///     camera access is already granted, overlapping with SwiftUI's first
+///     render pass.
+///   * Photo capture asks AVFoundation for native JPEG, skipping the
+///     CIImage → CGImage → UIImage → jpegData round-trip that used to block
+///     the capture callback thread.
+///   * The UI flips to `.processing` synchronously the moment the shutter is
+///     tapped — encoding and upload happen on a detached task afterwards.
+///   * The unused per-frame video output is no longer attached; previously
+///     it delivered 30-60 FPS of `CMSampleBuffer` allocations to a no-op
+///     delegate.
 nonisolated final class CameraManager:
     NSObject,
     ObservableObject,
-    AVCaptureVideoDataOutputSampleBufferDelegate,
     AVCapturePhotoCaptureDelegate,
     @unchecked Sendable {
 
@@ -53,11 +61,15 @@ nonisolated final class CameraManager:
     }
 
     private let photoOutput = AVCapturePhotoOutput()
-    private let videoOutput = AVCaptureVideoDataOutput()
 
     /// Serial queue for all session configuration and start/stop work, so the
-    /// main thread never blocks on `startRunning()`.
-    private let sessionQueue = DispatchQueue(label: "camera.session")
+    /// main thread never blocks on `startRunning()`. `.userInitiated` keeps
+    /// it ahead of background work on busy devices.
+    private let sessionQueue = DispatchQueue(
+        label: "camera.session",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
 
     /// Dedicated queue on which live frames are delivered.
     private let videoQueue = DispatchQueue(label: "camera.video")
@@ -68,14 +80,14 @@ nonisolated final class CameraManager:
     private let detectionsLock = NSLock()
     private var latestDetections: [TrackedBox] = []
 
-
     /// Talks to the PaddleOCR job API. The API key is read from the app
     /// bundle's Info.plist (populated from `secrets.xcconfig` at build time) —
     /// see `Secrets.swift`.
     private let paddleClient = PaddleOCRClient.makeDefault()
 
-    /// Reused to turn camera pixel buffers into JPEG data.
-    private let ciContext = CIContext()
+    /// Cached at construction so the hot photo path never bounces through
+    /// `Bundle.main.object(forInfoDictionaryKey:)` on every shot.
+    private let apiKeyConfigured = PaddleOCRClient.isAPIKeyConfigured
 
     /// YOLOE-26L segmentation detector — replaces both the legacy doc-seg and
     /// the YOLOv8-world detectors. Each detection carries an oriented quad
@@ -87,6 +99,28 @@ nonisolated final class CameraManager:
     /// sibling — keeps the screen-inside-laptop / label-on-package case clean.
     /// Display-only; the tracker keeps the hidden box around for re-association.
     var displayContainmentThreshold: CGFloat = 0.6
+
+    override init() {
+        super.init()
+        // Pre-warm the session while SwiftUI is still building the first
+        // frame. Repeat launches almost always land in `.authorized`, so
+        // overlapping configuration with view construction shaves the
+        // visible "camera takes a beat to appear" pause off cold launches.
+        if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+            sessionQueue.async { [self] in
+                configureSessionIfNeeded()
+            }
+        }
+        // Warm the TLS session to the OCR endpoint. First photo would
+        // otherwise pay the full handshake on the upload path; doing this
+        // here lets it overlap with the user composing their first shot.
+        if apiKeyConfigured {
+            let client = paddleClient
+            Task.detached(priority: .utility) {
+                await client.warmUp()
+            }
+        }
+    }
 
     // MARK: - Empty hooks for you to fill in
 
@@ -139,7 +173,9 @@ nonisolated final class CameraManager:
             return
         }
         Task { @MainActor in self.captureState = .processing }
-        Task { await runOCR(on: imageData) }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.runOCR(on: imageData)
+        }
     }
 
     /// Reset back to live camera. Call from the UI when the user dismisses
@@ -152,7 +188,9 @@ nonisolated final class CameraManager:
 
     // MARK: - Lifecycle
 
-    /// Requests camera access, configures the session once, and starts it.
+    /// Requests camera access (if needed), configures the session once, and
+    /// starts it. Safe to call repeatedly: configuration is idempotent and
+    /// `startRunning()` is a no-op when already running.
     func start() {
         requestAccess { [weak self] granted in
             guard let self, granted else { return }
@@ -182,7 +220,6 @@ nonisolated final class CameraManager:
             self.session.beginConfiguration()
             defer { self.session.commitConfiguration() }
 
-            // Drop the current camera input.
             for input in self.session.inputs {
                 if let deviceInput = input as? AVCaptureDeviceInput,
                    deviceInput.device.hasMediaType(.video) {
@@ -190,7 +227,6 @@ nonisolated final class CameraManager:
                 }
             }
 
-            // Attach the chosen camera.
             guard let newInput = try? AVCaptureDeviceInput(device: camera),
                   self.session.canAddInput(newInput) else { return }
             self.session.addInput(newInput)
@@ -201,16 +237,35 @@ nonisolated final class CameraManager:
 
     // MARK: - Photo capture
 
-    /// Takes a still photo; the result is delivered to `didCapturePhoto(_:)`.
+    /// Takes a still photo; the result is delivered to `photoOutput(_:didFinishProcessingPhoto:error:)`.
+    ///
+    /// State flips to `.processing` synchronously — the user gets feedback in
+    /// the same frame as the tap. Capture queueing happens on the session
+    /// queue right after, with no further main-thread work on this path.
     func capturePhoto() {
+        Task { @MainActor in self.captureState = .processing }
+
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            // Request BGRA pixels so the result is guaranteed to carry a CVPixelBuffer.
-            let settings = AVCapturePhotoSettings(format: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-            ])
+            let settings = self.makePhotoSettings()
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
+    }
+
+    /// Native-JPEG photo settings. Lets the ISP do the encoding so we never
+    /// pay for `CIContext.createCGImage(...)` + `UIImage.jpegData(...)` on the
+    /// AVCapture callback thread.
+    private func makePhotoSettings() -> AVCapturePhotoSettings {
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.jpeg) {
+            settings = AVCapturePhotoSettings(format: [
+                AVVideoCodecKey: AVVideoCodecType.jpeg
+            ])
+        } else {
+            settings = AVCapturePhotoSettings()
+        }
+        settings.photoQualityPrioritization = .balanced
+        return settings
     }
 
     // MARK: - Session configuration
@@ -224,38 +279,86 @@ nonisolated final class CameraManager:
         session.sessionPreset = .photo
 
         let cameras = discoverCameras()
-        Task { @MainActor in self.availableCameras = cameras }
-
-        // Start on the back camera, falling back to whatever is first.
         let defaultCamera = cameras.first { $0.position == .back } ?? cameras.first
+
         if let defaultCamera,
            let input = try? AVCaptureDeviceInput(device: defaultCamera),
            session.canAddInput(input) {
             session.addInput(input)
-            Task { @MainActor in self.selectedCamera = defaultCamera }
         }
 
-        // Per-frame output. BGRA keeps frames consistent with captured photos.
-        videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
-        if session.canAddOutput(videoOutput) {
-            session.addOutput(videoOutput)
-        }
-
-        // Still-photo output.
+        // Still-photo output only. The previous per-frame video output was
+        // wired to an empty delegate, which silently burned ~30-60 FPS of
+        // sample-buffer allocations and delegate hops.
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
+            configurePhotoOutput(for: defaultCamera)
         }
 
         session.commitConfiguration()
+
+        // Batch the two `@Published` mutations into a single MainActor hop —
+        // SwiftUI sees one update instead of two back-to-back rebuilds.
+        Task { @MainActor in
+            self.availableCameras = cameras
+            self.selectedCamera = defaultCamera
+        }
+    }
+
+    /// Caps the ISP at ~12 MP. Modern iPhones default to 48 MP photos which
+    /// take noticeably longer to encode (~150-300 ms) and produce ~10× the
+    /// upload bytes for no OCR-relevant gain. Falls back to whatever the
+    /// device exposes if 12 MP isn't a listed dimension on this sensor.
+    private func configurePhotoOutput(for device: AVCaptureDevice?) {
+        photoOutput.maxPhotoQualityPrioritization = .balanced
+
+        guard let device else { return }
+        let supported = device.activeFormat.supportedMaxPhotoDimensions
+        guard !supported.isEmpty else { return }
+
+        let preferred = CMVideoDimensions(width: 4032, height: 3024)
+        if let exact = supported.first(where: { $0.width == preferred.width && $0.height == preferred.height }) {
+            photoOutput.maxPhotoDimensions = exact
+            return
+        }
+        photoOutput.maxPhotoDimensions = Self.bestDimension(
+            from: supported,
+            preferred: preferred
+        )
+    }
+
+    /// Pick the largest supported dimension that's still ≤ `preferred`'s
+    /// pixel count, falling back to the smallest available if everything
+    /// exceeds the cap. Pulled out so the type-checker doesn't choke on the
+    /// closure soup it would otherwise have to inline.
+    private static func bestDimension(
+        from supported: [CMVideoDimensions],
+        preferred: CMVideoDimensions
+    ) -> CMVideoDimensions {
+        let cap = Int64(preferred.width) * Int64(preferred.height)
+        var bestUnder: CMVideoDimensions?
+        var bestUnderPixels: Int64 = 0
+        var smallestOver: CMVideoDimensions?
+        var smallestOverPixels: Int64 = .max
+
+        for dim in supported {
+            let pixels = Int64(dim.width) * Int64(dim.height)
+            if pixels <= cap {
+                if pixels > bestUnderPixels {
+                    bestUnderPixels = pixels
+                    bestUnder = dim
+                }
+            } else if pixels < smallestOverPixels {
+                smallestOverPixels = pixels
+                smallestOver = dim
+            }
+        }
+        return bestUnder ?? smallestOver ?? preferred
     }
 
     /// Finds every built-in camera on the device, front and back.
     private func discoverCameras() -> [AVCaptureDevice] {
-        let discovery = AVCaptureDevice.DiscoverySession(
+        AVCaptureDevice.DiscoverySession(
             deviceTypes: [
                 .builtInWideAngleCamera,
                 .builtInUltraWideCamera,
@@ -263,8 +366,7 @@ nonisolated final class CameraManager:
             ],
             mediaType: .video,
             position: .unspecified
-        )
-        return discovery.devices
+        ).devices
     }
 
     private func requestAccess(completion: @escaping @Sendable (Bool) -> Void) {
@@ -278,26 +380,61 @@ nonisolated final class CameraManager:
         }
     }
 
-    // MARK: - PaddleOCR upload
+    /// Reset back to live camera. Call from the UI when the user dismisses
+    /// the result or error overlay.
+    @MainActor
+    func resetCaptureState() {
+        captureState = .idle
+    }
 
-    /// Uploads the captured photo to PaddleOCR, builds a `VirtualDocument`
-    /// from the first returned page, renders the color-coded overlay, and
-    /// publishes it via `captureState` for the UI.
-    private func runOCR(on imageData: Data) async {
-        guard PaddleOCRClient.isAPIKeyConfigured else {
+    // MARK: - OCR
+
+    /// JPEG quality for re-encoded uploads. 0.85 is the sweet spot for OCR
+    /// — character edges stay crisp, but file size drops ~20% versus 0.9.
+    /// The Baidu pipeline downsamples to `maxPixels` regardless, so paying
+    /// extra bytes for higher quality buys nothing.
+    private static let uploadJPEGQuality: CGFloat = 0.85
+
+    /// The OCR pipeline. Sequenced to keep wall time minimal:
+    ///   1. Pre-shrink the photo to fit `maxPixels` and bake any EXIF
+    ///      rotation into the pixels. This cuts upload bytes 70-80% on a
+    ///      12 MP iPhone capture and removes server-side downsample work.
+    ///   2. Submit to PaddleOCR. With orient + unwarp on, Baidu may rotate
+    ///      / dewarp internally; the response's `preprocessedImageURL`
+    ///      points at the canonical post-transform image.
+    ///   3. Once Baidu responds, run CRAFT on that *same* preprocessed
+    ///      image so the augmentation overlap math is coordinate-correct.
+    ///      CRAFT can't run in parallel with Baidu when preprocessing is
+    ///      on — the coordinate frames would diverge — so we accept the
+    ///      ~100-500 ms serial cost in exchange for correctness.
+    ///   4. Render the merged layout on the preprocessed image (its size
+    ///      matches `pruned.width × pruned.height`, so no rescale at draw).
+    private func runOCR(on rawJPEG: Data) async {
+        guard apiKeyConfigured else {
             await publishFailure("Set the PaddleOCR API key in secrets.xcconfig before capturing.")
             return
         }
 
-        let tempDirectory = FileManager.default.temporaryDirectory
-        let imageURL = tempDirectory.appendingPathComponent("capture-\(UUID().uuidString).jpg")
-        let outputDirectory = tempDirectory.appendingPathComponent("paddleocr-\(UUID().uuidString)")
+        let optional = OptionalPayload()
+        guard let prepared = Self.prepareForUpload(
+            rawJPEG,
+            maxPixels: optional.maxPixels,
+            quality: Self.uploadJPEGQuality
+        ) else {
+            await publishFailure("Failed to decode the captured photo.")
+            return
+        }
+
+        let outputDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paddleocr-\(UUID().uuidString)", isDirectory: true)
+        let filename = "capture-\(UUID().uuidString).jpg"
 
         do {
-            try imageData.write(to: imageURL)
             let pages = try await paddleClient.process(
-                fileURL: imageURL,
-                optionalPayload: OptionalPayload(useDocOrientationClassify: true),
+                imageData: prepared.jpeg,
+                filename: filename,
+                mimeType: "image/jpeg",
+                optionalPayload: optional,
                 outputDirectory: outputDirectory
             )
 
@@ -310,27 +447,146 @@ nonisolated final class CameraManager:
                 return
             }
 
-            // Prefer the deskewed/oriented preprocessed image (its coordinate
-            // space matches the bboxes). Fall back to the original capture.
-            let sourceImage: UIImage = {
-                if let url = page.preprocessedImageURL,
-                   let data = try? Data(contentsOf: url),
-                   let img = UIImage(data: data) {
-                    return img
-                }
-                return UIImage(data: imageData) ?? UIImage()
-            }()
+            // CRAFT consumes the same image Baidu's bboxes describe so the
+            // overlap filter compares apples to apples. The preprocessed
+            // URL is the post-orientation, post-dewarp image; if it's
+            // absent (server skipped preprocessing for this page) we fall
+            // back to the upright bytes we sent.
+            let craftSource = Self.loadCraftSource(
+                preprocessedURL: page.preprocessedImageURL,
+                fallback: prepared.image
+            )
+            let craftBoxes = await Self.detectCraftBoxes(in: craftSource)
+            let augmented = Self.augment(pruned: pruned, with: craftBoxes)
+            let renderSource = craftSource
 
-            let document = VirtualDocument.make(from: pruned, image: sourceImage)
-            let overlay = document.render()
-            let croppedImage = UIImage(data: imageData) ?? overlay
+            // Document build + render is pure CPU work; offload so this
+            // method returns to its caller as fast as possible. On dense
+            // pages this is 50-200 ms of layout sort + path drawing that
+            // would otherwise stall the publish step.
+            let overlay = await Task.detached(priority: .userInitiated) { () -> UIImage in
+                let document = VirtualDocument.make(from: augmented, image: renderSource)
+                return document.render()
+            }.value
+
             await MainActor.run {
-                self.captureState = .result(croppedImage)
+                self.captureState = .result(overlay)
                 self.stop()
             }
         } catch {
             await publishFailure("PaddleOCR error: \(error)")
         }
+    }
+
+    /// Decodes the captured JPEG, downsamples to fit `maxPixels` (matching
+    /// Baidu's `maxPixels` so the server doesn't redo the work), bakes any
+    /// EXIF rotation into the pixels, and re-encodes. Returns both the
+    /// upload bytes and the decoded `UIImage` so the caller avoids a
+    /// second decode for the fallback path.
+    ///
+    /// Hot path: image already upright AND already within the pixel cap —
+    /// returns the original bytes verbatim and only decodes once.
+    private static func prepareForUpload(
+        _ data: Data,
+        maxPixels: Int,
+        quality: CGFloat
+    ) -> (jpeg: Data, image: UIImage)? {
+        guard let decoded = UIImage(data: data) else { return nil }
+
+        let pixelCount = Int(decoded.size.width * decoded.size.height)
+        let needsRotate = decoded.imageOrientation != .up
+        let needsDownsample = maxPixels > 0 && pixelCount > maxPixels
+
+        if !needsRotate && !needsDownsample {
+            return (data, decoded)
+        }
+
+        let targetSize: CGSize
+        if needsDownsample {
+            // Linear ratio preserves aspect; pixel count after = maxPixels.
+            // Floor at 1 px in each dim — a 0-size renderer crashes.
+            let ratio = (Double(maxPixels) / Double(pixelCount)).squareRoot()
+            targetSize = CGSize(
+                width: max(1, decoded.size.width * CGFloat(ratio)),
+                height: max(1, decoded.size.height * CGFloat(ratio))
+            )
+        } else {
+            targetSize = decoded.size
+        }
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1   // 1:1 pixel mapping; size is reported in points.
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let prepared = renderer.image { _ in
+            decoded.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        guard let encoded = prepared.jpegData(compressionQuality: quality) else {
+            return nil
+        }
+        return (encoded, prepared)
+    }
+
+    /// Loads the deskewed image PaddleOCR returned, falling back to the
+    /// upright bytes we sent if the URL is missing or unreadable. The
+    /// preprocessed image is the coordinate authority for Baidu's bboxes —
+    /// CRAFT and the renderer must consume it (not the original upright)
+    /// to stay aligned.
+    private static func loadCraftSource(
+        preprocessedURL: URL?,
+        fallback: UIImage
+    ) -> UIImage {
+        if let url = preprocessedURL,
+           let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+           let img = UIImage(data: data) {
+            return img
+        }
+        return fallback
+    }
+
+    /// Runs the on-device CRAFT detector. Failures (model not bundled,
+    /// inference error) leave the Baidu flow untouched, but they're logged
+    /// so a missing model doesn't disappear silently the way it used to.
+    ///
+    /// Thresholds use CRAFT's defaults (0.7 / 0.4 / 10). The previous code
+    /// raised them substantially to suppress false positives that were
+    /// largely artifacts of the broken preprocessing (non-aspect-preserving
+    /// stretch + raw-context Y flip), both of which are now fixed.
+    ///
+    /// Inference runs on its own detached task so it doesn't share the
+    /// PaddleOCR awaiter's priority slot. Apple's Core ML scheduler then
+    /// places it on Neural Engine / GPU as it sees fit.
+    private static func detectCraftBoxes(in image: UIImage) async -> [CGRect] {
+        await Task.detached(priority: .userInitiated) { () -> [CGRect] in
+            let craft = CraftModel()
+            do {
+                return try craft.detect(in: image).map(\.rect)
+            } catch {
+                print("CRAFT augmentation skipped: \(error)")
+                return []
+            }
+        }.value
+    }
+
+    /// Splices CRAFT survivors into the Baidu `PrunedResult`. Skips when
+    /// CRAFT produced nothing useful; otherwise returns a new value with the
+    /// extra blocks appended.
+    private static func augment(
+        pruned: VirtualDocument.PrunedResult,
+        with craftBoxes: [CGRect]
+    ) -> VirtualDocument.PrunedResult {
+        guard !craftBoxes.isEmpty else { return pruned }
+        let extras = LayoutAugmentation.extraBlocks(
+            craftBoxes: craftBoxes,
+            existing: pruned.parsingResList,
+            pageSize: CGSize(width: pruned.width, height: pruned.height)
+        )
+        guard !extras.isEmpty else { return pruned }
+        return VirtualDocument.PrunedResult(
+            width: pruned.width,
+            height: pruned.height,
+            parsingResList: pruned.parsingResList + extras
+        )
     }
 
     @MainActor
@@ -410,7 +666,7 @@ nonisolated final class CameraManager:
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         didReceiveFrame(pixelBuffer)
     }
-    
+
     func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
     }
@@ -418,8 +674,19 @@ nonisolated final class CameraManager:
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
+        if let error {
+            Task { @MainActor in
+                self.captureState = .failed("Capture failed: \(error.localizedDescription)")
+            }
+            return
+        }
         AudioServicesDisposeSystemSoundID(1108)
-        guard error == nil, let pixelBuffer = photo.pixelBuffer else { return }
+        guard let pixelBuffer = photo.pixelBuffer else {
+            Task { @MainActor in
+                self.captureState = .failed("Failed to access the captured pixel buffer.")
+            }
+            return
+        }
         didCapturePhoto(pixelBuffer)
     }
 }

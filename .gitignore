@@ -41,3 +41,10 @@ AlphaG3n/secrets.xcconfig
 *.secret.xcconfig
 .env
 .env.*
+
+# Core ML model artifacts — large binaries kept out of source control.
+# Drop the .mlpackage in AlphaG3n/ locally; Xcode's synchronized group
+# picks it up at build time and emits the compiled .mlmodelc into the app.
+*.mlpackage
+*.mlmodel
+*.mlmodelc

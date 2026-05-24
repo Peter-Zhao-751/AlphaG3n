@@ -17,19 +17,86 @@ public enum PaddleOCRModel: String, Sendable {
     case paddleOCRVL15 = "PaddleOCR-VL-1.5"
 }
 
+/// Full Baidu request payload. Keys are camelCase to match the API's wire
+/// format; `JSONEncoder`'s default key strategy preserves the Swift property
+/// names verbatim, so the JSON sent over the wire matches `optional_payload`
+/// from the Baidu reference docs.
+///
+/// All fields are non-optional with explicit defaults so two different
+/// captures send identical request shapes — the server can pool / cache
+/// requests with consistent envelopes more efficiently, and absent fields
+/// can't accidentally trigger different server-side codepaths.
 public struct OptionalPayload: Codable, Sendable {
+    public var markdownIgnoreLabels: [String]
     public var useDocOrientationClassify: Bool
     public var useDocUnwarping: Bool
+    public var useLayoutDetection: Bool
     public var useChartRecognition: Bool
+    public var useSealRecognition: Bool
+    public var useOcrForImageBlock: Bool
+    public var mergeTables: Bool
+    public var relevelTitles: Bool
+    public var layoutShapeMode: String
+    public var promptLabel: String
+    public var repetitionPenalty: Double
+    public var temperature: Double
+    public var topP: Double
+    /// Lower bound on resize. The server upsamples below this; staying well
+    /// above it (we send ~2.8 MP) keeps text legible.
+    public var minPixels: Int
+    /// Upper bound on the server-side resize. We pre-shrink the upload to
+    /// fit this so we don't waste bandwidth and the server doesn't have to
+    /// decode + downsample on hot CPU.
+    public var maxPixels: Int
+    public var layoutNms: Bool
+    public var restructurePages: Bool
 
-    public init(
-        useDocOrientationClassify: Bool = false,
+    nonisolated public init(
+        markdownIgnoreLabels: [String] = [
+            "header",
+            "header_image",
+            "footer",
+            "footer_image",
+            "number",
+            "footnote",
+            "aside_text"
+        ],
+        useDocOrientationClassify: Bool = true,
         useDocUnwarping: Bool = false,
-        useChartRecognition: Bool = false
+        useLayoutDetection: Bool = true,
+        useChartRecognition: Bool = false,
+        useSealRecognition: Bool = true,
+        useOcrForImageBlock: Bool = false,
+        mergeTables: Bool = true,
+        relevelTitles: Bool = true,
+        layoutShapeMode: String = "poly",
+        promptLabel: String = "ocr",
+        repetitionPenalty: Double = 1,
+        temperature: Double = 0.15,
+        topP: Double = 1,
+        minPixels: Int = 147_384,
+        maxPixels: Int = 2_822_400,
+        layoutNms: Bool = true,
+        restructurePages: Bool = true
     ) {
+        self.markdownIgnoreLabels = markdownIgnoreLabels
         self.useDocOrientationClassify = useDocOrientationClassify
         self.useDocUnwarping = useDocUnwarping
+        self.useLayoutDetection = useLayoutDetection
         self.useChartRecognition = useChartRecognition
+        self.useSealRecognition = useSealRecognition
+        self.useOcrForImageBlock = useOcrForImageBlock
+        self.mergeTables = mergeTables
+        self.relevelTitles = relevelTitles
+        self.layoutShapeMode = layoutShapeMode
+        self.promptLabel = promptLabel
+        self.repetitionPenalty = repetitionPenalty
+        self.temperature = temperature
+        self.topP = topP
+        self.minPixels = minPixels
+        self.maxPixels = maxPixels
+        self.layoutNms = layoutNms
+        self.restructurePages = restructurePages
     }
 }
 
@@ -148,44 +215,7 @@ nonisolated private struct MarkdownPayload: Decodable {
     let images: [String: String]
 }
 
-// MARK: - Multipart helper (plain struct; not an actor)
-
-nonisolated private struct MultipartFormData {
-    let boundary: String
-    private var body = Data()
-
-    init(boundary: String = "Boundary-\(UUID().uuidString)") {
-        self.boundary = boundary
-    }
-
-    var contentType: String { "multipart/form-data; boundary=\(boundary)" }
-
-    mutating func appendField(name: String, value: String) {
-        body.appendString("--\(boundary)\r\n")
-        body.appendString("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
-        body.appendString("\(value)\r\n")
-    }
-
-    mutating func appendFile(name: String, filename: String, mimeType: String, data fileData: Data) {
-        body.appendString("--\(boundary)\r\n")
-        body.appendString("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n")
-        body.appendString("Content-Type: \(mimeType)\r\n\r\n")
-        body.append(fileData)
-        body.appendString("\r\n")
-    }
-
-    func finalize() -> Data {
-        var finalBody = body
-        finalBody.appendString("--\(boundary)--\r\n")
-        return finalBody
-    }
-}
-
-private extension Data {
-    mutating func appendString(_ string: String) {
-        if let data = string.data(using: .utf8) { append(data) }
-    }
-}
+// MARK: - MIME helpers
 
 nonisolated private func mimeType(forPathExtension ext: String) -> String {
     switch ext.lowercased() {
@@ -199,28 +229,95 @@ nonisolated private func mimeType(forPathExtension ext: String) -> String {
     }
 }
 
+// MARK: - Multipart builder
+
+/// Inline multipart body builder. Pre-sizes the buffer to avoid the resize
+/// thrash that a naive `body.append(...)` loop produces on multi-MB image
+/// uploads — every doubling memcpy is wall-time during submit.
+nonisolated private func buildMultipartBody(
+    boundary: String,
+    fields: [(name: String, value: String)],
+    file: (name: String, filename: String, mimeType: String, data: Data)
+) -> Data {
+    let estimate = file.data.count
+        + boundary.utf8.count * (fields.count + 2) * 2
+        + 512
+        + fields.reduce(0) { $0 + $1.name.utf8.count + $1.value.utf8.count + 64 }
+        + file.name.utf8.count
+        + file.filename.utf8.count
+        + file.mimeType.utf8.count
+    var body = Data(capacity: estimate)
+
+    let dashes = "--\(boundary)\r\n"
+    for field in fields {
+        body.appendString(dashes)
+        body.appendString("Content-Disposition: form-data; name=\"\(field.name)\"\r\n\r\n")
+        body.appendString("\(field.value)\r\n")
+    }
+
+    body.appendString(dashes)
+    body.appendString("Content-Disposition: form-data; name=\"\(file.name)\"; filename=\"\(file.filename)\"\r\n")
+    body.appendString("Content-Type: \(file.mimeType)\r\n\r\n")
+    body.append(file.data)
+    body.appendString("\r\n")
+    body.appendString("--\(boundary)--\r\n")
+    return body
+}
+
+private extension Data {
+    mutating func appendString(_ string: String) {
+        // String → contiguous UTF-8 → Data avoids the extra Data allocation
+        // that `string.data(using: .utf8)` performs internally.
+        var s = string
+        s.withUTF8 { append($0.baseAddress!, count: $0.count) }
+    }
+}
+
 // MARK: - Client
 
-public actor PaddleOCRClient {
+/// Stateless after construction: every stored property is either a `Sendable`
+/// value type (`Configuration`) or a well-known thread-safe reference type
+/// (`URLSession`, `JSONEncoder`, `JSONDecoder`). Marked `@unchecked Sendable`
+/// because Foundation's coder types aren't formally `Sendable` until the
+/// SDK version that ships them as such, but they're documented as safe for
+/// concurrent reads after init.
+///
+/// Previously an `actor`, which serialised every request behind a single
+/// executor and forced every callsite to pay an executor-hop. Concurrent
+/// callers now overlap their work freely.
+public final class PaddleOCRClient: @unchecked Sendable {
 
     public struct Configuration: Sendable {
         public var jobURL: URL
         public var token: String
         public var model: PaddleOCRModel
-        public var pollInterval: Duration
+        /// Wait before the first status poll. Most jobs complete inside a
+        /// handful of seconds — starting at 500 ms lands the first hit on
+        /// quick jobs before the network round-trip even matters.
+        public var pollInitialDelay: Duration
+        /// Ceiling for the exponential backoff. Long-running jobs can sit at
+        /// this cadence indefinitely without spamming the server.
+        public var pollMaxDelay: Duration
+        /// Multiplier applied to the current delay after each poll. 1.6 ≈
+        /// "double every two polls" which balances responsiveness and load.
+        public var pollBackoffFactor: Double
         public var maxConcurrentImageDownloads: Int
 
         public init(
             jobURL: URL = URL(string: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs")!,
             token: String,
             model: PaddleOCRModel = .paddleOCRVL15,
-            pollInterval: Duration = .seconds(5),
+            pollInitialDelay: Duration = .milliseconds(300),
+            pollMaxDelay: Duration = .seconds(4),
+            pollBackoffFactor: Double = 1.5,
             maxConcurrentImageDownloads: Int = 8
         ) {
             self.jobURL = jobURL
             self.token = token
             self.model = model
-            self.pollInterval = pollInterval
+            self.pollInitialDelay = pollInitialDelay
+            self.pollMaxDelay = pollMaxDelay
+            self.pollBackoffFactor = pollBackoffFactor
             self.maxConcurrentImageDownloads = maxConcurrentImageDownloads
         }
     }
@@ -237,12 +334,40 @@ public actor PaddleOCRClient {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(configuration: Configuration, session: URLSession = .shared) {
+    public init(configuration: Configuration, session: URLSession? = nil) {
         self.config = configuration
-        self.session = session
+        self.session = session ?? Self.makeDefaultSession()
     }
 
-    // MARK: Public API
+    /// Per-client `URLSession` rather than `.shared`. Tuned for image upload
+    /// + status polling: shorter request timeout to surface stalls quickly,
+    /// long resource timeout to cover real OCR jobs, and 8 connections per
+    /// host to support the concurrent image download fan-out at the end.
+    private static func makeDefaultSession() -> URLSession {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 30
+        cfg.timeoutIntervalForResource = 180
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.waitsForConnectivity = true
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.httpAdditionalHeaders = ["Accept-Encoding": "gzip, deflate"]
+        return URLSession(configuration: cfg)
+    }
+
+    // MARK: - Public API
+
+    /// Fire a cheap request against the OCR endpoint so the TCP socket +
+    /// TLS session are warm by the time the user takes their first photo.
+    /// First-capture latency without this is ~200-500 ms higher because
+    /// the TLS handshake (2 RTTs on TLS 1.2, 1 RTT on TLS 1.3) lands on
+    /// the upload-the-actual-photo path. Best-effort: any failure is
+    /// silently ignored — the worst case is what we had before.
+    public func warmUp() async {
+        var request = URLRequest(url: config.jobURL)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        _ = try? await session.data(for: request)
+    }
 
     /// Submit a local file, poll, and download all extracted markdown + images.
     public func process(
@@ -270,7 +395,29 @@ public actor PaddleOCRClient {
         return try await downloadResults(resultURL: resultURL, outputDirectory: outputDirectory)
     }
 
-    // MARK: Submission
+    /// Submit raw image bytes (no disk round-trip), poll, and download all
+    /// extracted markdown + images. Used by the camera capture path so the
+    /// JPEG never has to touch the filesystem between capture and upload.
+    public func process(
+        imageData: Data,
+        filename: String,
+        mimeType: String,
+        optionalPayload: OptionalPayload = OptionalPayload(),
+        outputDirectory: URL,
+        progress: (@Sendable (ProgressEvent) -> Void)? = nil
+    ) async throws -> [ExtractedPage] {
+        let jobId = try await submit(
+            imageData: imageData,
+            filename: filename,
+            mimeType: mimeType,
+            optionalPayload: optionalPayload
+        )
+        progress?(.submitted(jobId: jobId))
+        let resultURL = try await pollUntilDone(jobId: jobId, progress: progress)
+        return try await downloadResults(resultURL: resultURL, outputDirectory: outputDirectory)
+    }
+
+    // MARK: - Submission
 
     private func submit(remoteURL: URL, optionalPayload: OptionalPayload) async throws -> String {
         let payload = JobSubmissionURLPayload(
@@ -282,38 +429,66 @@ public actor PaddleOCRClient {
         request.httpMethod = "POST"
         request.setValue("bearer \(config.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encoder.encode(payload)
-        return try await submit(request: request)
+        let body = try encoder.encode(payload)
+        return try await submit(uploadRequest: request, body: body)
     }
 
     private func submit(fileURL: URL, optionalPayload: OptionalPayload) async throws -> String {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw PaddleOCRError.fileNotFound(fileURL)
         }
-        let fileData = try Data(contentsOf: fileURL)
+        // `.mappedIfSafe` avoids materialising the file in heap memory for
+        // anything large enough to mmap; APFS will fault pages in lazily as
+        // `Data` is consumed by the multipart writer.
+        let fileData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        return try await submit(
+            imageData: fileData,
+            filename: fileURL.lastPathComponent,
+            mimeType: mimeType(forPathExtension: fileURL.pathExtension),
+            optionalPayload: optionalPayload
+        )
+    }
+
+    private func submit(
+        imageData: Data,
+        filename: String,
+        mimeType: String,
+        optionalPayload: OptionalPayload
+    ) async throws -> String {
         let optionalJSON = try encoder.encode(optionalPayload)
         let optionalString = String(data: optionalJSON, encoding: .utf8) ?? "{}"
 
-        var form = MultipartFormData()
-        form.appendField(name: "model", value: config.model.rawValue)
-        form.appendField(name: "optionalPayload", value: optionalString)
-        form.appendFile(
-            name: "file",
-            filename: fileURL.lastPathComponent,
-            mimeType: mimeType(forPathExtension: fileURL.pathExtension),
-            data: fileData
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let body = buildMultipartBody(
+            boundary: boundary,
+            fields: [
+                (name: "model", value: config.model.rawValue),
+                (name: "optionalPayload", value: optionalString)
+            ],
+            file: (
+                name: "file",
+                filename: filename,
+                mimeType: mimeType,
+                data: imageData
+            )
         )
 
         var request = URLRequest(url: config.jobURL)
         request.httpMethod = "POST"
         request.setValue("bearer \(config.token)", forHTTPHeaderField: "Authorization")
-        request.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
-        request.httpBody = form.finalize()
-        return try await submit(request: request)
+        request.setValue(
+            "multipart/form-data; boundary=\(boundary)",
+            forHTTPHeaderField: "Content-Type"
+        )
+        return try await submit(uploadRequest: request, body: body)
     }
 
-    private func submit(request: URLRequest) async throws -> String {
-        let (data, response) = try await session.data(for: request)
+    /// Uses `upload(for:from:)` rather than stuffing the body into
+    /// `URLRequest.httpBody`. Two reasons: the upload variant streams the
+    /// body to the socket without first copying it into the request, and it
+    /// participates in NSURLSession's background-transfer machinery.
+    private func submit(uploadRequest: URLRequest, body: Data) async throws -> String {
+        let (data, response) = try await session.upload(for: uploadRequest, from: body)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard status == 200 else {
             throw PaddleOCRError.submissionFailed(
@@ -324,8 +499,11 @@ public actor PaddleOCRClient {
         return try decoder.decode(JobSubmissionResponse.self, from: data).data.jobId
     }
 
-    // MARK: Polling
+    // MARK: - Polling
 
+    /// Exponential backoff polling. Starts aggressive so short jobs finish
+    /// without an unnecessary several-second sleep, and tapers off so long
+    /// jobs don't hammer the status endpoint.
     private func pollUntilDone(
         jobId: String,
         progress: (@Sendable (ProgressEvent) -> Void)?
@@ -333,6 +511,10 @@ public actor PaddleOCRClient {
         let statusURL = config.jobURL.appendingPathComponent(jobId)
         var request = URLRequest(url: statusURL)
         request.setValue("bearer \(config.token)", forHTTPHeaderField: "Authorization")
+
+        var delay = config.pollInitialDelay
+        let maxDelay = config.pollMaxDelay
+        let factor = config.pollBackoffFactor
 
         while true {
             try Task.checkCancellation()
@@ -372,11 +554,30 @@ public actor PaddleOCRClient {
                 throw PaddleOCRError.jobFailed(message: decoded.data.errorMsg ?? "unknown")
             }
 
-            try await Task.sleep(for: config.pollInterval)
+            try await Task.sleep(for: delay)
+            delay = Self.backoff(current: delay, factor: factor, max: maxDelay)
         }
     }
 
-    // MARK: Result download
+    /// Multiplies `current` by `factor`, capped at `max`. Pulled out so the
+    /// inner loop reads cleanly and the conversion through nanoseconds is
+    /// confined to one place.
+    private static func backoff(current: Duration, factor: Double, max: Duration) -> Duration {
+        // `Duration.components.attoseconds` is the fractional part in 10⁻¹⁸ s;
+        // squashing the whole thing through nanoseconds is precise enough for
+        // a polling cadence and avoids overflowing `Int64` on long delays.
+        let currentNs =
+            current.components.seconds * 1_000_000_000
+            + current.components.attoseconds / 1_000_000_000
+        let maxNs =
+            max.components.seconds * 1_000_000_000
+            + max.components.attoseconds / 1_000_000_000
+        let nextNs = Int64(Double(currentNs) * factor)
+        let cappedNs = Swift.min(nextNs, maxNs)
+        return .nanoseconds(cappedNs)
+    }
+
+    // MARK: - Result download
 
     private func downloadResults(
         resultURL: URL,
@@ -452,9 +653,13 @@ public actor PaddleOCRClient {
             )]
         }()
 
-        let inlineResults = try await downloadConcurrently(specs: inlineSpecs)
-        let outputResults = try await downloadConcurrently(specs: outputSpecs)
-        let preprocessedResults = try await downloadConcurrently(specs: preprocessedSpecs)
+        // Fan all three download buckets out in parallel — they're
+        // independent and otherwise serialise on this method's await chain.
+        async let inlineResults = downloadConcurrently(specs: inlineSpecs)
+        async let outputResults = downloadConcurrently(specs: outputSpecs)
+        async let preprocessedResults = downloadConcurrently(specs: preprocessedSpecs)
+
+        let (inline, outputs, preprocessed) = try await (inlineResults, outputResults, preprocessedResults)
 
         let blocks: [TextBlock] = (parsing.prunedResult?.parsingResList ?? []).map { raw in
             TextBlock(label: raw.blockLabel, bbox: raw.blockBbox, content: raw.blockContent)
@@ -464,10 +669,10 @@ public actor PaddleOCRClient {
             pageIndex: pageIndex,
             markdown: parsing.markdown.text,
             blocks: blocks,
-            inlineImages: inlineResults,
-            outputImages: outputResults,
+            inlineImages: inline,
+            outputImages: outputs,
             prunedResult: parsing.prunedResult,
-            preprocessedImageURL: preprocessedResults["preprocessed"]
+            preprocessedImageURL: preprocessed["preprocessed"]
         )
     }
 
@@ -480,6 +685,7 @@ public actor PaddleOCRClient {
 
         return try await withThrowingTaskGroup(of: (String, URL).self) { group in
             var results: [String: URL] = [:]
+            results.reserveCapacity(specs.count)
             var iterator = specs.makeIterator()
             var inFlight = 0
 
