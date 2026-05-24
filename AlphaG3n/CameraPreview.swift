@@ -110,11 +110,9 @@ struct CameraPreview: UIViewRepresentable {
             let highlight = UIBezierPath()
             for (i, detection) in lastDetections.enumerated() {
                 let target = (i == winnerIdx) ? highlight : regular
-                if let quad = detection.normalizedQuad {
-                    target.append(quadPath(quad))
-                } else {
-                    target.append(rectPath(detection.normalizedRect))
-                }
+                // Upright rect overlay; the oriented quad is kept on the
+                // detection for capture-time perspective correction only.
+                target.append(rectPath(detection.normalizedRect))
             }
             // Avoid the implicit animation on `path` so the boxes track frames cleanly.
             CATransaction.begin()
@@ -163,24 +161,6 @@ struct CameraPreview: UIViewRepresentable {
             )
             let viewRect = videoPreviewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
             return UIBezierPath(rect: viewRect)
-        }
-
-        private func quadPath(_ quad: Quad) -> UIBezierPath {
-            // Each Vision-normalized corner (bottom-left origin) maps to a
-            // metadata-space point (top-left origin) via a Y flip, then the
-            // preview layer converts it to view coords with rotation +
-            // aspect-fill cropping handled for us.
-            let viewPoints = quad.points.map { p -> CGPoint in
-                let metadataPoint = CGPoint(x: p.x, y: 1 - p.y)
-                return videoPreviewLayer.layerPointConverted(fromCaptureDevicePoint: metadataPoint)
-            }
-            let bezier = UIBezierPath()
-            bezier.move(to: viewPoints[0])
-            for i in 1..<viewPoints.count {
-                bezier.addLine(to: viewPoints[i])
-            }
-            bezier.close()
-            return bezier
         }
     }
 }

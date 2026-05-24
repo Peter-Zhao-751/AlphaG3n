@@ -69,7 +69,7 @@ public struct OptionalPayload: Codable, Sendable {
         useOcrForImageBlock: Bool = false,
         mergeTables: Bool = true,
         relevelTitles: Bool = true,
-        layoutShapeMode: String = "poly",
+        layoutShapeMode: String = "rect",
         promptLabel: String = "ocr",
         repetitionPenalty: Double = 1,
         temperature: Double = 0.15,

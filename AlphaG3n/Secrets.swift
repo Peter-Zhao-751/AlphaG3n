@@ -12,6 +12,12 @@ import Foundation
 enum Secrets {
     static var jinaAPIKey: String? { value(for: "JINA_API_KEY") }
     static var paddleAPIKey: String? { value(for: "PADDLE_API_KEY") }
+    /// OpenAI API key for the per-crop vision OCR pass (see `OpenAIClient`).
+    static var openAIAPIKey: String? { value(for: "OPENAI_API_KEY") }
+    /// Modal PaddleOCR-VL endpoint URL — the camera OCR path requires it.
+    static var modalOCRURL: String? { value(for: "MODAL_OCR_URL") }
+    /// Optional bearer token if the Modal endpoint is behind auth; `nil` ⇒ unauthenticated.
+    static var modalOCRToken: String? { value(for: "MODAL_OCR_TOKEN") }
 
     /// Returns the trimmed Info.plist value, or `nil` if the key is missing,
     /// empty, or still the unresolved `$(VAR)` placeholder (which happens when

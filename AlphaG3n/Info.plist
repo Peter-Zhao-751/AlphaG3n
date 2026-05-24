@@ -4,6 +4,12 @@
 <dict>
 	<key>JINA_API_KEY</key>
 	<string>$(JINA_API_KEY)</string>
+	<key>MODAL_OCR_TOKEN</key>
+	<string>$(MODAL_OCR_TOKEN)</string>
+	<key>MODAL_OCR_URL</key>
+	<string>$(MODAL_OCR_URL)</string>
+	<key>OPENAI_API_KEY</key>
+	<string>$(OPENAI_API_KEY)</string>
 	<key>PADDLE_API_KEY</key>
 	<string>$(PADDLE_API_KEY)</string>
 </dict>

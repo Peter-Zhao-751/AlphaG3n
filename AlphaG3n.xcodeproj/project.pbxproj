@@ -15,6 +15,13 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+				run_box_merge.swift,
+				run_craft.swift,
+				run_crop_geometry.swift,
+				run_html_extract.swift,
+				run_openai_batch.swift,
+				run_qr_geometry.swift,
+				run_sentence_split.swift,
 			);
 			target = D0AFA3742FC230DF000490E9 /* AlphaG3n */;
 		};

@@ -67,8 +67,13 @@ nonisolated final class CameraManager:
 
     enum CaptureState: @unchecked Sendable {
         case idle
-        case processing
-        case result(UIImage)
+        case processing(UIImage?)
+        /// The finished overlay image plus the structured document behind it, so
+        /// the result screen can place tappable targets over each text block and
+        /// drill into its sentences. The image alone can't be hit-tested. The
+        /// trailing array carries any website-linking QR codes found on the page,
+        /// each a tap target that opens a spoken summary of the linked site.
+        case result(UIImage, VirtualDocument, [DetectedQRCode])
         case failed(String)
     }
 
@@ -111,14 +116,11 @@ nonisolated final class CameraManager:
     /// synchronous, so frame delivery stops the instant we commit.
     private var activeVideoInput: AVCaptureDeviceInput?
 
-    /// Talks to the PaddleOCR job API. The API key is read from the app
-    /// bundle's Info.plist (populated from `secrets.xcconfig` at build time) —
-    /// see `Secrets.swift`.
-    private let paddleClient = PaddleOCRClient.makeDefault()
-
-    /// Cached at construction so the hot photo path never bounces through
-    /// `Bundle.main.object(forInfoDictionaryKey:)` on every shot.
-    private let apiKeyConfigured = PaddleOCRClient.isAPIKeyConfigured
+    /// Talks to the self-hosted PaddleOCR-VL deployment on Modal. The endpoint
+    /// URL is read from the app bundle's Info.plist (populated from
+    /// `secrets.xcconfig` at build time) — see `Secrets.swift`. `nil` when the
+    /// endpoint isn't configured; the capture path gates on it being non-nil.
+    private let ocrClient = ModalOCRClient.makeDefault()
 
     /// Reused to turn camera pixel buffers into JPEG data.
     private let ciContext = CIContext()
@@ -155,8 +157,7 @@ nonisolated final class CameraManager:
         // Warm the TLS session to the OCR endpoint. First photo would
         // otherwise pay the full handshake on the upload path; doing this
         // here lets it overlap with the user composing their first shot.
-        if apiKeyConfigured {
-            let client = paddleClient
+        if let client = ocrClient {
             Task.detached(priority: .utility) {
                 await client.warmUp()
             }
@@ -233,6 +234,11 @@ nonisolated final class CameraManager:
                 self.start()
                 return
             }
+            // Surface the exact bytes headed to OCR — the perspective-corrected
+            // crop, or the full uncropped frame when no quad was highlighted —
+            // behind the “Reading document…” spinner so the user sees what's
+            // being read. `UIImage(data:)` is lazy, so this stays cheap on main.
+            self.captureState = .processing(UIImage(data: imageData))
             self.ocrTask = Task.detached(priority: .userInitiated) { [weak self] in
                 await self?.runOCR(on: imageData)
             }
@@ -349,7 +355,7 @@ nonisolated final class CameraManager:
     /// the same frame as the tap. Capture queueing happens on the session
     /// queue right after, with no further main-thread work on this path.
     func capturePhoto() {
-        Task { @MainActor in self.captureState = .processing }
+        Task { @MainActor in self.captureState = .processing(nil) }
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -614,22 +620,20 @@ nonisolated final class CameraManager:
     ///   1. Pre-shrink the photo to fit `maxPixels` and bake any EXIF
     ///      rotation into the pixels. This cuts upload bytes 70-80% on a
     ///      12 MP iPhone capture and removes server-side downsample work.
-    ///   2. Submit to PaddleOCR (Baidu). With orient + unwarp on, Baidu may
-    ///      rotate / dewarp internally; the response's `preprocessedImageURL`
-    ///      points at the canonical post-transform image.
-    ///   3. Once Baidu responds, run CRAFT on that *same* preprocessed image
-    ///      so the augmentation overlap math is coordinate-correct. CRAFT can't
-    ///      run in parallel with Baidu when preprocessing is on — the coordinate
-    ///      frames would diverge — so we accept the ~100-500 ms serial cost in
-    ///      exchange for correctness. CRAFT now normalizes orientation and flips
-    ///      its boxes upright internally, so its boxes land in Baidu's top-left
+    ///   2. Submit the upright bytes to the Modal OCR endpoint. It returns
+    ///      layout + markdown inline, with bboxes in the coordinate frame of
+    ///      the image we uploaded — the Modal path returns no separate
+    ///      preprocessed image, so `preprocessedImageURL` is always nil.
+    ///   3. Run CRAFT on that *same* uploaded image so the augmentation overlap
+    ///      math is coordinate-correct. CRAFT normalizes orientation and flips
+    ///      its boxes upright internally, so its boxes land in the same top-left
     ///      frame and the overlap filter compares like with like.
-    ///   4. Merge the CRAFT survivors into Baidu's layout and render on the
-    ///      preprocessed image (its size matches `pruned.width × pruned.height`,
-    ///      so no rescale at draw).
+    ///   4. Merge the CRAFT survivors into the layout and render on that image
+    ///      (its size matches `pruned.width × pruned.height`, so no rescale at
+    ///      draw).
     private func runOCR(on rawJPEG: Data) async {
-        guard apiKeyConfigured else {
-            await publishFailure("Set the PaddleOCR API key in secrets.xcconfig before capturing.")
+        guard let ocrClient = ocrClient else {
+            await publishFailure("Set the Modal OCR endpoint (MODAL_OCR_URL) in secrets.xcconfig before capturing.")
             return
         }
 
@@ -643,17 +647,13 @@ nonisolated final class CameraManager:
             return
         }
 
-        let outputDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paddleocr-\(UUID().uuidString)", isDirectory: true)
         let filename = "capture-\(UUID().uuidString).jpg"
 
         do {
-            let pages = try await paddleClient.process(
+            let pages = try await ocrClient.process(
                 imageData: prepared.jpeg,
                 filename: filename,
-                mimeType: "image/jpeg",
-                optionalPayload: optional,
-                outputDirectory: outputDirectory
+                mimeType: "image/jpeg"
             )
 
             // The user may have hit Cancel while the upload was in flight; bail
@@ -662,11 +662,11 @@ nonisolated final class CameraManager:
             guard !Task.isCancelled else { return }
 
             guard let page = pages.first else {
-                await publishFailure("PaddleOCR returned no pages.")
+                await publishFailure("OCR returned no pages.")
                 return
             }
             guard let pruned = page.prunedResult else {
-                await publishFailure("PaddleOCR response was missing layout data.")
+                await publishFailure("OCR response was missing layout data.")
                 return
             }
 
@@ -683,19 +683,31 @@ nonisolated final class CameraManager:
             let augmented = Self.augment(pruned: pruned, with: craftBoxes)
             let renderSource = craftSource
 
+            // Read every text-class crop through OpenAI (concurrently) BEFORE we
+            // render, so the overlay can show the transcriptions in each box.
+            // Non-readable text blocks are dropped here; graphics blocks pass
+            // through. The spinner stays up for this whole batch — nothing is
+            // shown to the user until every reading is back.
+            let prepared = await Self.applyOCRReadings(to: augmented, image: renderSource)
+
+            guard !Task.isCancelled else { return }
+
             // Document build + render is pure CPU work; offload so this method
             // returns to its caller as fast as possible. On dense pages this is
-            // 50-200 ms of layout sort + path drawing that would otherwise stall
-            // the publish step.
-            let overlay = await Task.detached(priority: .userInitiated) { () -> UIImage in
-                let document = VirtualDocument.make(from: augmented, image: renderSource)
-                return document.render()
+            // 50-200 ms of layout sort + text/path drawing. QR detection rides
+            // along on the same hop: it's on-device Vision over the render
+            // source (no network — the linked site is only fetched if the user
+            // taps the QR later), and only QRs linking to a website are kept.
+            let (overlay, document, qrCodes) = await Task.detached(priority: .userInitiated) { () -> (UIImage, VirtualDocument, [DetectedQRCode]) in
+                let document = VirtualDocument.make(from: prepared, image: renderSource)
+                let qrCodes = QRCodeDetector.detect(in: renderSource, pageSize: document.pageSize)
+                return (document.render(), document, qrCodes)
             }.value
 
             guard !Task.isCancelled else { return }
 
             await MainActor.run {
-                self.captureState = .result(overlay)
+                self.captureState = .result(overlay, document, qrCodes)
                 self.stop()
                 self.ocrTask = nil
             }
@@ -703,7 +715,7 @@ nonisolated final class CameraManager:
             // A cancelled upload surfaces as a thrown error; don't pop it over
             // the camera the user has already returned to.
             guard !Task.isCancelled else { return }
-            await publishFailure("PaddleOCR error: \(error)")
+            await publishFailure("OCR error: \(error)")
         }
     }
 
@@ -818,6 +830,155 @@ nonisolated final class CameraManager:
         )
     }
 
+    // MARK: - Per-crop OCR (console diagnostic)
+
+    /// Default per-side crop margin. 0 == crop exactly to the bounding box, so
+    /// the image sent to OpenAI is the same size as the box. CRAFT boxes get
+    /// their own 10% enlargement upstream (`LayoutAugmentation.craftBoxEnlargement`).
+    private static let cropMargin: CGFloat = 0
+    /// JPEG quality for the per-crop OpenAI OCR pass. 0.9 keeps small-text
+    /// edges crisp; the crops are small, so the byte cost is minor.
+    private static let cropJPEGQuality: CGFloat = 0.9
+
+    /// Crops every merged box out of `image` (padded by `margin` per side),
+    /// reads the crops concurrently through `OpenAIClient.readText`, matches each
+    /// reading back to its box by position (readText preserves input order), and
+    /// prints the result. Console-only: never throws, never touches
+    /// `captureState`; a missing key, no croppable boxes, or a failed read just
+    /// logs and returns.
+    /// Whether a block is sent to the OpenAI reader and, once read, rendered as
+    /// centered text: prose / titles / headers / footers / footnotes / numbers /
+    /// tables / formulas, plus CRAFT boxes (which arrive labeled "text"). Pure
+    /// graphics and `unknown` are excluded — see
+    /// `VirtualDocument.readableTextLabels`.
+    static func isReadableTextBlock(_ block: VirtualDocument.PrunedResult.RawBlock) -> Bool {
+        block.isFromCraft
+            || VirtualDocument.readableTextLabels.contains(
+                VirtualDocument.BlockLabel(apiValue: block.blockLabel))
+    }
+
+    /// Crops every text-class block, reads the crops concurrently through
+    /// `OpenAIClient.readText`, and returns a new `PrunedResult` where:
+    ///   • readable text blocks keep their box and carry the transcription,
+    ///   • non-readable text blocks (empty / blurry / irrelevant / failed /
+    ///     un-croppable) are dropped entirely, and
+    ///   • graphics + `unknown` blocks pass through untouched (colored box, no
+    ///     text).
+    /// Original block order is preserved. With no API key configured the input
+    /// is returned unchanged, so the overlay still shows type-colored boxes.
+    private static func applyOCRReadings(
+        to pruned: VirtualDocument.PrunedResult,
+        image: UIImage,
+        margin: CGFloat = cropMargin
+    ) async -> VirtualDocument.PrunedResult {
+        guard let apiKey = Secrets.openAIAPIKey else {
+            print("[crop-read] OPENAI_API_KEY not set — rendering type-colored boxes without text.")
+            return pruned
+        }
+
+        let textBlocks = pruned.parsingResList.filter(isReadableTextBlock)
+        guard !textBlocks.isEmpty else { return pruned }
+
+        let crops = BoundingBoxCropper.croppedJPEGs(
+            of: image,
+            blocks: textBlocks,
+            margin: margin,
+            quality: cropJPEGQuality
+        )
+        // No crop succeeded → no text block can be confirmed readable → drop
+        // them all, keeping only the graphics boxes.
+        guard !crops.isEmpty else {
+            return VirtualDocument.PrunedResult(
+                width: pruned.width,
+                height: pruned.height,
+                parsingResList: pruned.parsingResList.filter { !isReadableTextBlock($0) }
+            )
+        }
+
+        let client = OpenAIClient(apiKey: apiKey)
+        let start = Date()
+        let results = await client.readText(in: crops.map(\.jpeg))
+        let elapsed = Date().timeIntervalSince(start)
+
+        // Match each readable crop back to its block id → transcription.
+        var readableText: [Int: String] = [:]
+        for (crop, result) in zip(crops, results) {
+            if case .success(let reading) = result, reading.status == .readable {
+                let trimmed = reading.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { readableText[crop.block.blockId] = trimmed }
+            }
+        }
+
+        printReadings(
+            boxes: crops.map(\.block),
+            results: results,
+            totalBlocks: pruned.parsingResList.count,
+            elapsed: elapsed
+        )
+
+        // Rebuild in original order: readable text blocks carry their reading,
+        // non-readable text blocks vanish, everything else passes through.
+        let kept = pruned.parsingResList.compactMap { block -> VirtualDocument.PrunedResult.RawBlock? in
+            guard isReadableTextBlock(block) else { return block }
+            guard let text = readableText[block.blockId] else { return nil }
+            return block.replacingContent(text)
+        }
+
+        return VirtualDocument.PrunedResult(
+            width: pruned.width,
+            height: pruned.height,
+            parsingResList: kept
+        )
+    }
+
+    /// Prints a one-line summary plus one line per box matched to its reading.
+    /// `boxes[i]` corresponds to `results[i]`.
+    private static func printReadings(
+        boxes: [VirtualDocument.PrunedResult.RawBlock],
+        results: [Result<OpenAIClient.TextReading, Error>],
+        totalBlocks: Int,
+        elapsed: TimeInterval
+    ) {
+        var readable = 0, empty = 0, unreadable = 0, irrelevant = 0, failed = 0
+        var lines: [String] = []
+
+        for (box, result) in zip(boxes, results) {
+            let b = box.blockBbox
+            let bbox = b.count >= 4
+                ? String(format: "(%.0f,%.0f,%.0f,%.0f)", b[0], b[1], b[2], b[3])
+                : "(?)"
+            let craft = box.isFromCraft ? " [craft]" : ""
+            let head = "  #\(box.blockId) \(box.blockLabel)\(craft) bbox=\(bbox) → "
+
+            switch result {
+            case .success(let reading):
+                switch reading.status {
+                case .readable:
+                    readable += 1
+                    let text = reading.text.replacingOccurrences(of: "\n", with: " / ")
+                    lines.append(head + "readable: \"\(text)\"")
+                case .empty:
+                    empty += 1
+                    lines.append(head + "empty: \(reading.note)")
+                case .unreadable:
+                    unreadable += 1
+                    lines.append(head + "unreadable: \(reading.note)")
+                case .irrelevant:
+                    irrelevant += 1
+                    lines.append(head + "irrelevant: \(reading.note)")
+                }
+            case .failure(let error):
+                failed += 1
+                lines.append(head + "FAILURE: \(error.localizedDescription)")
+            }
+        }
+
+        print(String(
+            format: "[crop-read] %d merged boxes → %d crops → %d readable, %d empty, %d unreadable, %d irrelevant, %d failed (%.2fs)",
+            totalBlocks, results.count, readable, empty, unreadable, irrelevant, failed, elapsed))
+        for line in lines { print(line) }
+    }
+
     @MainActor
     private func publishFailure(_ message: String) {
         ocrTask = nil
@@ -845,9 +1006,21 @@ nonisolated final class CameraManager:
     /// Uses `CIPerspectiveCorrection`, which auto-sizes the output rectangle to
     /// the average length of opposing input sides — so the document's natural
     /// aspect ratio is preserved and features (text, lines, edges) aren't
-    /// stretched. The 4 corners are re-sorted into TL/TR/BR/BL in CIImage space
-    /// (bottom-left origin) so the filter receives a correctly-oriented quad
-    /// regardless of which corner the detector listed first.
+    /// stretched.
+    ///
+    /// Orientation is locked to the **detected object**, not to how the phone is
+    /// held: `objectOrientedCorners` finds the quad's principal (long) axis and
+    /// labels the corners so the rectified crop comes out with that axis
+    /// vertical. This is why the result no longer rotates when you tilt the
+    /// phone — the old code re-labeled corners by their position in the sensor
+    /// frame, so the crop spun with the device and broke entirely for objects
+    /// sitting near 45° in the frame. The encoded JPEG carries **no** device
+    /// orientation tag (`.up`); any residual 180° / text-up ambiguity is
+    /// resolved downstream by PaddleOCR's document-orientation classifier.
+    ///
+    /// `orientation` is used only for the degenerate-quad fallback below, where
+    /// there's no object axis to lock onto and a plain full-frame encode (tagged
+    /// with the device orientation) is the best we can do.
     private func jpegData(from pixelBuffer: CVPixelBuffer,
                           perspectiveCorrectingTo quad: Quad,
                           orientation: UIImage.Orientation) -> Data? {
@@ -865,17 +1038,9 @@ nonisolated final class CameraManager:
                     y: extent.minY + p.y * extent.height)
         }
 
-        // Standard "order_points" sort in bottom-left-origin space:
-        //   BL = min(x + y)     TR = max(x + y)
-        //   TL = min(x - y)     BR = max(x - y)
-        let sums = pixelPoints.map { $0.x + $0.y }
-        let diffs = pixelPoints.map { $0.x - $0.y }
-        guard let bl = sums.indices.min(by: { sums[$0] < sums[$1] }),
-              let tr = sums.indices.max(by: { sums[$0] < sums[$1] }),
-              let tl = diffs.indices.min(by: { diffs[$0] < diffs[$1] }),
-              let br = diffs.indices.max(by: { diffs[$0] < diffs[$1] }),
-              Set([bl, tr, tl, br]).count == 4 else {
-            // Degenerate quad — fall back to a plain encode of the full frame.
+        guard let c = Self.objectOrientedCorners(pixelPoints) else {
+            // Degenerate (collinear / zero-area) quad — fall back to a plain
+            // encode of the full frame.
             return jpegData(from: pixelBuffer, orientation: orientation)
         }
 
@@ -883,17 +1048,81 @@ nonisolated final class CameraManager:
             return jpegData(from: pixelBuffer, orientation: orientation)
         }
         filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(CIVector(cgPoint: pixelPoints[tl]), forKey: "inputTopLeft")
-        filter.setValue(CIVector(cgPoint: pixelPoints[tr]), forKey: "inputTopRight")
-        filter.setValue(CIVector(cgPoint: pixelPoints[bl]), forKey: "inputBottomLeft")
-        filter.setValue(CIVector(cgPoint: pixelPoints[br]), forKey: "inputBottomRight")
+        filter.setValue(CIVector(cgPoint: pixelPoints[c.tl]), forKey: "inputTopLeft")
+        filter.setValue(CIVector(cgPoint: pixelPoints[c.tr]), forKey: "inputTopRight")
+        filter.setValue(CIVector(cgPoint: pixelPoints[c.bl]), forKey: "inputBottomLeft")
+        filter.setValue(CIVector(cgPoint: pixelPoints[c.br]), forKey: "inputBottomRight")
 
         guard let output = filter.outputImage,
               let cgImage = ciContext.createCGImage(output, from: output.extent) else {
             return nil
         }
-        return UIImage(cgImage: cgImage, scale: 1, orientation: orientation)
+        // Already upright in the object's frame — no device-orientation tag.
+        return UIImage(cgImage: cgImage, scale: 1, orientation: .up)
             .jpegData(compressionQuality: 0.9)
+    }
+
+    /// Labels a quad's four corners as TL/TR/BR/BL **in the object's own frame**,
+    /// returning indices into `p`. The labeling is invariant to how the phone is
+    /// held, which is what keeps the rectified crop from rotating as the device
+    /// tilts/rolls.
+    ///
+    /// Method: take the quad's principal (long) axis from the second moments of
+    /// its corners, de-rotate the corners so that axis is vertical, then assign
+    /// top/bottom by `y` and left/right by `x` in that canonical frame. Doing
+    /// the assignment after de-rotation sidesteps the classic "order_points"
+    /// (sum/difference) failure, which mislabels — and at exactly 45° collapses —
+    /// once a quad is rotated more than 45° in the frame.
+    ///
+    /// A rectangle's long axis doesn't say which end is "up"; that 180° choice
+    /// is resolved (via `rho` below) toward the right-side-up branch for normal
+    /// document capture, since the OCR backend no longer re-orients the image.
+    /// Returns nil for a degenerate (zero-area) quad.
+    private static func objectOrientedCorners(
+        _ p: [CGPoint]
+    ) -> (tl: Int, tr: Int, br: Int, bl: Int)? {
+        guard p.count == 4 else { return nil }
+
+        // Shoelace area — a collinear/zero-area quad has no meaningful axis.
+        var signedArea = 0.0
+        for i in 0..<4 {
+            let a = p[i], b = p[(i + 1) % 4]
+            signedArea += Double(a.x * b.y - b.x * a.y)
+        }
+        guard abs(signedArea) * 0.5 > 1e-6 else { return nil }
+
+        let cx = p.map(\.x).reduce(0, +) / 4
+        let cy = p.map(\.y).reduce(0, +) / 4
+
+        // Second moments of the corners about the centroid -> principal angle.
+        var sxx = 0.0, syy = 0.0, sxy = 0.0
+        for q in p {
+            let dx = Double(q.x - cx), dy = Double(q.y - cy)
+            sxx += dx * dx; syy += dy * dy; sxy += dx * dy
+        }
+        let theta = 0.5 * atan2(2 * sxy, sxx - syy)   // long-axis angle
+        // Bring the long axis vertical. It's a line, so there are two ways up;
+        // we use -π/2 (not +π/2) so documents land right-side-up for normal
+        // capture. The OCR backend no longer returns a re-oriented image, so
+        // this branch choice is final — the +π/2 branch comes out upside down.
+        let rho = -Double.pi / 2 - theta
+        let cosR = CGFloat(cos(rho)), sinR = CGFloat(sin(rho))
+
+        // De-rotate corners about the centroid into the canonical frame, where
+        // the quad is axis-aligned and a plain min/max split is unambiguous.
+        let r = p.map { q -> CGPoint in
+            let dx = q.x - cx, dy = q.y - cy
+            return CGPoint(x: dx * cosR - dy * sinR, y: dx * sinR + dy * cosR)
+        }
+
+        let byY = Array(0..<4).sorted { r[$0].y > r[$1].y }
+        let top = byY[0..<2], bottom = byY[2..<4]
+        guard let tl = top.min(by: { r[$0].x < r[$1].x }),
+              let tr = top.max(by: { r[$0].x < r[$1].x }),
+              let bl = bottom.min(by: { r[$0].x < r[$1].x }),
+              let br = bottom.max(by: { r[$0].x < r[$1].x }),
+              Set([tl, tr, br, bl]).count == 4 else { return nil }
+        return (tl, tr, br, bl)
     }
 
     // MARK: - AVCapture delegate callbacks

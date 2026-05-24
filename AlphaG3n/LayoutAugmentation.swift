@@ -24,16 +24,26 @@ public enum LayoutAugmentation {
     /// outline.
     public static let defaultCoverageThreshold: CGFloat = 0.6
 
+    /// CRAFT survivor boxes are grown by this fraction (after merging, before
+    /// they become blocks) so the per-crop OCR gets a little margin around tight
+    /// character regions. 0.10 == 10% larger (×1.1, 5% per side).
+    public static let craftBoxEnlargement: CGFloat = 0.10
+
     /// Returns the CRAFT survivors as new `RawBlock`s ready to be appended
-    /// to the Baidu `parsingResList`. IDs and group IDs continue past the
-    /// highest existing values; every survivor gets its own group so the
-    /// reading-order sort in `VirtualDocument.make` sends them to the end
-    /// (they have no `blockOrder`, since CRAFT doesn't know reading order).
+    /// to the Baidu `parsingResList`. Survivors are first enlarged by
+    /// `mergeEnlargement` and fused where their grown forms overlap (see
+    /// `BoxMerge`), so neighbouring fragments collapse into one region. IDs and
+    /// group IDs continue past the highest existing values; every block gets its
+    /// own group so the reading-order sort in `VirtualDocument.make` sends them
+    /// to the end (they have no `blockOrder`, since CRAFT doesn't know reading
+    /// order).
     public static func extraBlocks(
         craftBoxes: [CGRect],
         existing: [VirtualDocument.PrunedResult.RawBlock],
         pageSize: CGSize,
-        coverageThreshold: CGFloat = defaultCoverageThreshold
+        coverageThreshold: CGFloat = defaultCoverageThreshold,
+        mergeEnlargement: CGFloat = BoxMerge.defaultEnlargement,
+        boxEnlargement: CGFloat = craftBoxEnlargement
     ) -> [VirtualDocument.PrunedResult.RawBlock] {
         guard !craftBoxes.isEmpty else { return [] }
 
@@ -46,10 +56,25 @@ public enum LayoutAugmentation {
         )
         guard !survivors.isEmpty else { return [] }
 
+        // Enlarge each survivor and fuse any whose grown forms overlap into one
+        // box (the bounding rect of the pre-enlarged originals), so character /
+        // word fragments collapse into a single region.
+        let merged = BoxMerge.merge(survivors, enlargement: mergeEnlargement)
+
+        // Grow the final CRAFT boxes a little so tight character regions aren't
+        // clipped when cropped for OCR; clamp back inside the page.
+        let pageBounds = CGRect(origin: .zero, size: pageSize)
+        let finalBoxes: [CGRect] = boxEnlargement <= 0 ? merged : merged.map { box in
+            let grown = box.insetBy(dx: -box.width * boxEnlargement / 2,
+                                    dy: -box.height * boxEnlargement / 2)
+            let clamped = grown.intersection(pageBounds)
+            return clamped.isNull ? box : clamped
+        }
+
         let baseID = (existing.map(\.blockId).max() ?? -1) + 1
         let baseGroup = (existing.map(\.groupId).max() ?? -1) + 1
 
-        return survivors.enumerated().map { offset, rect in
+        return finalBoxes.enumerated().map { offset, rect in
             VirtualDocument.PrunedResult.RawBlock(
                 blockLabel: "text",
                 blockContent: "",
@@ -67,7 +92,8 @@ public enum LayoutAugmentation {
                     [Double(rect.maxX), Double(rect.minY)],
                     [Double(rect.maxX), Double(rect.maxY)],
                     [Double(rect.minX), Double(rect.maxY)]
-                ]
+                ],
+                isFromCraft: true
             )
         }
     }

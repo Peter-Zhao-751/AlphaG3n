@@ -99,6 +99,23 @@ public extension VirtualDocument {
             case .image(let p): return p.order
             }
         }
+
+        /// True only for CRAFT-augmented text parts; the renderer draws these red.
+        public var isFromCraft: Bool {
+            switch self {
+            case .text(let p):  return p.isFromCraft
+            case .image:        return false
+            }
+        }
+
+        /// Transcribed text for text parts; empty for image parts. The renderer
+        /// draws this centered in the box when the label is a readable-text type.
+        public var content: String {
+            switch self {
+            case .text(let p):  return p.content
+            case .image:        return ""
+            }
+        }
     }
 
     struct TextPart: Sendable, Identifiable, Hashable {
@@ -108,6 +125,9 @@ public extension VirtualDocument {
         public let bbox: CGRect
         public let polygon: [CGPoint]
         public let order: Int?
+        /// True when this part came from CRAFT layout augmentation; the renderer
+        /// draws these red to mark text the OCR API missed.
+        public let isFromCraft: Bool
 
         public init(
             id: Int,
@@ -115,7 +135,8 @@ public extension VirtualDocument {
             content: String,
             bbox: CGRect,
             polygon: [CGPoint],
-            order: Int?
+            order: Int?,
+            isFromCraft: Bool = false
         ) {
             self.id = id
             self.label = label
@@ -123,6 +144,7 @@ public extension VirtualDocument {
             self.bbox = bbox
             self.polygon = polygon
             self.order = order
+            self.isFromCraft = isFromCraft
         }
     }
 
@@ -173,6 +195,12 @@ public extension VirtualDocument {
             public let groupId: Int
             public let blockPolygonPoints: [[Double]]?
 
+            /// True for blocks injected by CRAFT layout augmentation rather than
+            /// decoded from the OCR API. Deliberately absent from `CodingKeys`,
+            /// so the API decoder ignores it and it defaults to `false`; only
+            /// `LayoutAugmentation.extraBlocks` sets it `true`.
+            public var isFromCraft: Bool = false
+
             public init(
                 blockLabel: String,
                 blockContent: String,
@@ -180,7 +208,8 @@ public extension VirtualDocument {
                 blockId: Int,
                 blockOrder: Int?,
                 groupId: Int,
-                blockPolygonPoints: [[Double]]?
+                blockPolygonPoints: [[Double]]?,
+                isFromCraft: Bool = false
             ) {
                 self.blockLabel = blockLabel
                 self.blockContent = blockContent
@@ -189,6 +218,7 @@ public extension VirtualDocument {
                 self.blockOrder = blockOrder
                 self.groupId = groupId
                 self.blockPolygonPoints = blockPolygonPoints
+                self.isFromCraft = isFromCraft
             }
 
             enum CodingKeys: String, CodingKey {
@@ -199,6 +229,21 @@ public extension VirtualDocument {
                 case blockOrder = "block_order"
                 case groupId = "group_id"
                 case blockPolygonPoints = "block_polygon_points"
+            }
+
+            /// Copy of this block with `blockContent` swapped out — used to splice
+            /// an OpenAI transcription back into a decoded block before rendering.
+            func replacingContent(_ newContent: String) -> RawBlock {
+                RawBlock(
+                    blockLabel: blockLabel,
+                    blockContent: newContent,
+                    blockBbox: blockBbox,
+                    blockId: blockId,
+                    blockOrder: blockOrder,
+                    groupId: groupId,
+                    blockPolygonPoints: blockPolygonPoints,
+                    isFromCraft: isFromCraft
+                )
             }
         }
 
@@ -221,6 +266,15 @@ public extension VirtualDocument {
 public extension VirtualDocument {
 
     static let imageLabels: Set<BlockLabel> = [.image, .footerImage, .headerImage]
+
+    /// Labels whose crops carry readable prose worth sending to the OCR reader
+    /// and, once read, drawing as centered text. Pure graphics (image /
+    /// header_image / footer_image, chart, seal) and `unknown` are excluded.
+    /// CRAFT boxes arrive labeled `.text`, so they pass this set too.
+    static let readableTextLabels: Set<BlockLabel> = [
+        .text, .docTitle, .paragraphTitle, .header, .footer,
+        .footnote, .visionFootnote, .asideText, .number, .table, .formula
+    ]
 
     static func make(from pruned: PrunedResult, image: UIImage) -> VirtualDocument {
         let pageSize = CGSize(width: pruned.width, height: pruned.height)
@@ -283,7 +337,8 @@ private extension VirtualDocument.Part {
             content: raw.blockContent,
             bbox: bbox,
             polygon: polygon,
-            order: raw.blockOrder
+            order: raw.blockOrder,
+            isFromCraft: raw.isFromCraft
         ))
     }
 }
@@ -327,17 +382,6 @@ public extension VirtualDocument {
         public var lineWidth: CGFloat
         public var fillAlpha: CGFloat
         public var cornerRadius: CGFloat
-        /// HSL saturation for generated pastel colors. ~0.40 produces soft pastels.
-        public var saturation: CGFloat
-        /// HSL lightness for generated pastel colors. ~0.82 keeps fills airy.
-        public var lightness: CGFloat
-        /// Two parts whose rectangles are within this fraction of the page
-        /// diagonal are considered neighbors that must receive contrasting hues.
-        public var adjacencyFraction: CGFloat
-        /// Number of distinct pastel hues used by the contrast-aware palette.
-        /// 48 keeps consecutive selections well-separated without bloating the
-        /// per-part picker loop.
-        public var paletteSize: Int
         /// Hard cap on points kept per overlay polygon. Polygons larger than
         /// this are simplified with Douglas-Peucker; values around 8 stay
         /// faithful to rotated text quads while throwing away noisy detours.
@@ -346,27 +390,50 @@ public extension VirtualDocument {
         /// tolerance. Smaller values keep more wobble; larger values flatten
         /// the outline more aggressively.
         public var polygonSimplifyFraction: CGFloat
+        /// Color of transcribed text drawn inside a box.
+        public var textColor: RGBA
+        /// Opaque chip drawn behind transcribed text so it stays legible over
+        /// the photographed page.
+        public var chipColor: RGBA
+        /// Alpha of that chip. High enough to read against busy backgrounds.
+        public var chipAlpha: CGFloat
+        /// Text-chip corner radius, as a fraction of the chip's own height.
+        public var chipCornerFraction: CGFloat
+        /// Largest in-box font size tried, as a fraction of the box height.
+        public var maxFontFraction: CGFloat
+        /// Floor for in-box text size, in image pixels. Below this the text is
+        /// truncated with an ellipsis rather than shrunk further.
+        public var minFontSize: CGFloat
+        /// Inset between the box edge and its text chip, as a fraction of the
+        /// smaller box dimension.
+        public var textPaddingFraction: CGFloat
 
         public init(
             lineWidth: CGFloat = 8,
-            fillAlpha: CGFloat = 0.25,
+            fillAlpha: CGFloat = 0.18,
             cornerRadius: CGFloat = 16,
-            saturation: CGFloat = 0.42,
-            lightness: CGFloat = 0.82,
-            adjacencyFraction: CGFloat = 0.12,
-            paletteSize: Int = 48,
             maxPolygonPoints: Int = 8,
-            polygonSimplifyFraction: CGFloat = 0.01
+            polygonSimplifyFraction: CGFloat = 0.01,
+            textColor: RGBA = RGBA(r: 0.10, g: 0.10, b: 0.12),
+            chipColor: RGBA = RGBA(r: 1, g: 1, b: 1),
+            chipAlpha: CGFloat = 0.90,
+            chipCornerFraction: CGFloat = 0.18,
+            maxFontFraction: CGFloat = 0.62,
+            minFontSize: CGFloat = 9,
+            textPaddingFraction: CGFloat = 0.06
         ) {
             self.lineWidth = lineWidth
             self.fillAlpha = fillAlpha
             self.cornerRadius = cornerRadius
-            self.saturation = saturation
-            self.lightness = lightness
-            self.adjacencyFraction = adjacencyFraction
-            self.paletteSize = paletteSize
             self.maxPolygonPoints = maxPolygonPoints
             self.polygonSimplifyFraction = polygonSimplifyFraction
+            self.textColor = textColor
+            self.chipColor = chipColor
+            self.chipAlpha = chipAlpha
+            self.chipCornerFraction = chipCornerFraction
+            self.maxFontFraction = maxFontFraction
+            self.minFontSize = minFontSize
+            self.textPaddingFraction = textPaddingFraction
         }
 
         public static let `default` = RenderStyle()
@@ -384,11 +451,9 @@ public extension VirtualDocument {
         let scaleX = pageSize.width  > 0 ? canvasSize.width  / pageSize.width  : 1
         let scaleY = pageSize.height > 0 ? canvasSize.height / pageSize.height : 1
 
-        let allParts = parts
-        let rectsByID = Dictionary(uniqueKeysWithValues: allParts.map {
+        let rectsByID = Dictionary(uniqueKeysWithValues: parts.map {
             ($0.id, Self.axisAlignedRect(for: $0))
         })
-        let colors = Self.assignColors(parts: allParts, rects: rectsByID, pageSize: pageSize, style: style)
 
         let renderer = UIGraphicsImageRenderer(size: canvasSize, format: format)
         return renderer.image { _ in
@@ -397,7 +462,11 @@ public extension VirtualDocument {
             for group in groups {
                 for part in group.parts {
                     guard let pageRect = rectsByID[part.id] else { continue }
-                    let rgba = colors[part.id] ?? RGBA(r: 0.5, g: 0.5, b: 0.5)
+                    // CRAFT-augmented boxes (text the OCR API missed) draw red;
+                    // every other block is colored by its layout type.
+                    let rgba = part.isFromCraft
+                        ? RGBA(r: 1, g: 0, b: 0)
+                        : Self.color(for: part.label)
                     let path = Self.overlayPath(
                         for: part,
                         bboxFallback: pageRect,
@@ -411,6 +480,22 @@ public extension VirtualDocument {
                     rgba.uiColor(alpha: 1).setStroke()
                     path.lineWidth = style.lineWidth
                     path.stroke()
+
+                    // A readable transcription rides on an opaque chip in the box
+                    // center so it stays legible over the photographed page.
+                    // Graphics blocks (and unknown) carry no drawable text.
+                    if Self.readableTextLabels.contains(part.label) {
+                        let text = part.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !text.isEmpty {
+                            let boxRect = CGRect(
+                                x: pageRect.minX * scaleX,
+                                y: pageRect.minY * scaleY,
+                                width: pageRect.width  * scaleX,
+                                height: pageRect.height * scaleY
+                            )
+                            Self.drawCenteredText(text, in: boxRect, style: style)
+                        }
+                    }
                 }
             }
         }
@@ -611,169 +696,109 @@ public extension VirtualDocument {
         abs(a.x - b.x) < 0.5 && abs(a.y - b.y) < 0.5
     }
 
-    /// Welsh-Powell graph coloring on a pre-built pastel palette. Parts that
-    /// sit near each other on the page get palette indices whose minimum
-    /// cyclic distance to neighbors is maximised, so adjacent overlays stay
-    /// visually distinct without falling back to a fixed label-keyed lookup.
-    /// Adjacency is built with a spatial grid so total cost is roughly O(N)
-    /// expected even for documents with thousands of blocks.
-    static func assignColors(
-        parts: [Part],
-        rects: [Int: CGRect],
-        pageSize: CGSize,
-        style: RenderStyle
-    ) -> [Int: RGBA] {
-        guard !parts.isEmpty else { return [:] }
-
-        let diagonal = sqrt(pageSize.width * pageSize.width + pageSize.height * pageSize.height)
-        let threshold = max(1, diagonal * style.adjacencyFraction)
-        let neighbors = buildAdjacency(parts: parts, rects: rects, threshold: threshold)
-
-        let paletteSize = max(8, style.paletteSize)
-        let goldenStep: CGFloat = 0.6180339887498949
-        let palette: [RGBA] = (0..<paletteSize).map { i in
-            let hue = (CGFloat(i) * goldenStep).truncatingRemainder(dividingBy: 1)
-            return pastelRGBA(hue: hue, saturation: style.saturation, lightness: style.lightness)
+    /// Fixed color per layout type. Red is deliberately absent — it's reserved
+    /// for CRAFT-augmented boxes (text the OCR API missed) — so a type color can
+    /// never be mistaken for a CRAFT box. Related types share a hue family
+    /// (titles violet-ish, images magenta-ish) while staying individually
+    /// distinct. Exhaustive over `BlockLabel`, so a new case forces a choice here.
+    static func color(for label: BlockLabel) -> RGBA {
+        switch label {
+        case .text:           return RGBA(r: 0.20, g: 0.48, b: 0.95) // blue
+        case .docTitle:       return RGBA(r: 0.36, g: 0.20, b: 0.80) // indigo
+        case .paragraphTitle: return RGBA(r: 0.60, g: 0.30, b: 0.90) // violet
+        case .header:         return RGBA(r: 0.20, g: 0.70, b: 0.95) // sky
+        case .footer:         return RGBA(r: 0.40, g: 0.55, b: 0.72) // steel
+        case .footnote:       return RGBA(r: 0.10, g: 0.62, b: 0.60) // teal
+        case .visionFootnote: return RGBA(r: 0.22, g: 0.75, b: 0.52) // mint
+        case .asideText:      return RGBA(r: 0.15, g: 0.78, b: 0.82) // cyan
+        case .number:         return RGBA(r: 0.50, g: 0.55, b: 0.62) // slate
+        case .table:          return RGBA(r: 0.20, g: 0.70, b: 0.30) // green
+        case .formula:        return RGBA(r: 0.62, g: 0.70, b: 0.18) // olive
+        case .image:          return RGBA(r: 0.62, g: 0.25, b: 0.72) // purple
+        case .headerImage:    return RGBA(r: 0.85, g: 0.30, b: 0.70) // magenta
+        case .footerImage:    return RGBA(r: 0.95, g: 0.45, b: 0.65) // pink
+        case .chart:          return RGBA(r: 0.95, g: 0.72, b: 0.15) // gold
+        case .seal:           return RGBA(r: 0.95, g: 0.55, b: 0.15) // orange
+        case .unknown:        return RGBA(r: 0.55, g: 0.55, b: 0.55) // gray
         }
+    }
 
-        // Welsh-Powell: highest-degree parts first, stable id tiebreak.
-        let order = parts.sorted { lhs, rhs in
-            let ln = neighbors[lhs.id]?.count ?? 0
-            let rn = neighbors[rhs.id]?.count ?? 0
-            if ln != rn { return ln > rn }
-            return lhs.id < rhs.id
-        }
+    /// Draws `text` centered in `box` on an opaque rounded chip. The font is the
+    /// largest size (capped at `maxFontFraction` of the box height) at which the
+    /// wrapped text still fits; below `minFontSize` it stops shrinking and
+    /// truncates with an ellipsis. The chip hugs the laid-out text — not the
+    /// whole box — so a short reading gets a small label, not a giant fill.
+    static func drawCenteredText(_ text: String, in box: CGRect, style: RenderStyle) {
+        let pad = max(2, min(box.width, box.height) * style.textPaddingFraction)
+        let avail = CGSize(width: max(1, box.width - 2 * pad),
+                           height: max(1, box.height - 2 * pad))
+        guard avail.width > 4, avail.height > 4 else { return }
 
-        var assigned: [Int: Int] = [:]
-        assigned.reserveCapacity(parts.count)
-        for (rank, part) in order.enumerated() {
-            let used = (neighbors[part.id] ?? []).reduce(into: Set<Int>()) { acc, n in
-                if let idx = assigned[n] { acc.insert(idx) }
-            }
-            assigned[part.id] = pickPaletteIndex(
-                avoiding: used,
-                paletteSize: paletteSize,
-                fallback: rank
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+
+        let (font, textSize) = bestFont(for: text, fitting: avail, style: style, paragraph: paragraph)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: style.textColor.uiColor(alpha: 1),
+            .paragraphStyle: paragraph
+        ]
+
+        // Chip hugs the text, clamped to the available area, centered in the box.
+        let chipW = min(avail.width,  textSize.width  + 2 * pad)
+        let chipH = min(avail.height, textSize.height + 2 * pad)
+        let chipRect = CGRect(x: box.midX - chipW / 2,
+                              y: box.midY - chipH / 2,
+                              width: chipW,
+                              height: chipH)
+        let chipPath = UIBezierPath(roundedRect: chipRect,
+                                    cornerRadius: chipH * style.chipCornerFraction)
+        style.chipColor.uiColor(alpha: style.chipAlpha).setFill()
+        chipPath.fill()
+
+        // Vertically center the (possibly multi-line) text within the chip.
+        let textRect = CGRect(x: chipRect.minX + pad,
+                              y: chipRect.midY - textSize.height / 2,
+                              width: chipRect.width - 2 * pad,
+                              height: textSize.height)
+        (text as NSString).draw(with: textRect,
+                                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
+                                attributes: attributes,
+                                context: nil)
+    }
+
+    /// Largest font (≤ `maxFontFraction` of `avail.height`, ≥ `minFontSize`) at
+    /// which `text` wraps to fit `avail`, plus the wrapped text's measured size.
+    /// Shrinks geometrically; at the floor it returns `minFontSize` regardless
+    /// and the caller's truncating draw handles any remaining overflow.
+    private static func bestFont(
+        for text: String,
+        fitting avail: CGSize,
+        style: RenderStyle,
+        paragraph: NSParagraphStyle
+    ) -> (UIFont, CGSize) {
+        var size = max(style.minFontSize, avail.height * style.maxFontFraction)
+        var measured = CGSize.zero
+        var attempts = 0
+        while attempts < 12 {
+            let font = UIFont.systemFont(ofSize: size, weight: .medium)
+            let bounds = (text as NSString).boundingRect(
+                with: CGSize(width: avail.width, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: font, .paragraphStyle: paragraph],
+                context: nil
             )
-        }
-
-        return assigned.mapValues { palette[$0] }
-    }
-
-    /// Spatial-hash adjacency: bucket each rect into grid cells sized by the
-    /// proximity threshold, then only compare rects sharing a cell. Expected
-    /// O(N) when blocks are well-distributed.
-    private static func buildAdjacency(
-        parts: [Part],
-        rects: [Int: CGRect],
-        threshold: CGFloat
-    ) -> [Int: [Int]] {
-        var neighbors: [Int: [Int]] = [:]
-        let cell = max(threshold, 1)
-
-        var grid: [GridKey: [Int]] = [:]
-        var partCells: [Int: [GridKey]] = [:]
-        partCells.reserveCapacity(parts.count)
-
-        for part in parts {
-            guard let r = rects[part.id] else { continue }
-            let minCx = Int(floor((r.minX - threshold) / cell))
-            let maxCx = Int(floor((r.maxX + threshold) / cell))
-            let minCy = Int(floor((r.minY - threshold) / cell))
-            let maxCy = Int(floor((r.maxY + threshold) / cell))
-            var keys: [GridKey] = []
-            keys.reserveCapacity((maxCx - minCx + 1) * (maxCy - minCy + 1))
-            for cx in minCx...maxCx {
-                for cy in minCy...maxCy {
-                    let key = GridKey(x: cx, y: cy)
-                    keys.append(key)
-                    grid[key, default: []].append(part.id)
-                }
+            measured = CGSize(width: ceil(bounds.width), height: ceil(bounds.height))
+            if measured.height <= avail.height || size <= style.minFontSize {
+                return (font, CGSize(width: min(measured.width, avail.width),
+                                     height: min(measured.height, avail.height)))
             }
-            partCells[part.id] = keys
+            size = max(style.minFontSize, size * 0.82)
+            attempts += 1
         }
-
-        let thresholdSq = threshold * threshold
-        for part in parts {
-            guard let a = rects[part.id], let keys = partCells[part.id] else { continue }
-            var seen = Set<Int>()
-            seen.insert(part.id)
-            var partNeighbors: [Int] = []
-            for key in keys {
-                guard let bucket = grid[key] else { continue }
-                for otherID in bucket where seen.insert(otherID).inserted {
-                    guard let b = rects[otherID] else { continue }
-                    if rectGapSquared(a, b) <= thresholdSq {
-                        partNeighbors.append(otherID)
-                    }
-                }
-            }
-            if !partNeighbors.isEmpty {
-                neighbors[part.id] = partNeighbors
-            }
-        }
-        return neighbors
-    }
-
-    private struct GridKey: Hashable {
-        let x: Int
-        let y: Int
-    }
-
-    /// Squared edge-to-edge distance between two axis-aligned rectangles.
-    /// Avoids a `sqrt` on the hot adjacency path. Overlap returns 0.
-    private static func rectGapSquared(_ a: CGRect, _ b: CGRect) -> CGFloat {
-        let dx = max(0, max(a.minX - b.maxX, b.minX - a.maxX))
-        let dy = max(0, max(a.minY - b.maxY, b.minY - a.maxY))
-        return dx * dx + dy * dy
-    }
-
-    /// Picks the palette index whose minimum cyclic distance to any used
-    /// index is maximised. Falls back to `rank` (modulo palette size) when no
-    /// neighbors have been colored yet so disconnected components spread out.
-    private static func pickPaletteIndex(
-        avoiding used: Set<Int>,
-        paletteSize: Int,
-        fallback: Int
-    ) -> Int {
-        if used.isEmpty {
-            return ((fallback % paletteSize) + paletteSize) % paletteSize
-        }
-        var bestIdx = 0
-        var bestDist = -1
-        for c in 0..<paletteSize {
-            if used.contains(c) { continue }
-            var minDist = paletteSize
-            for u in used {
-                let raw = abs(c - u)
-                let d = min(raw, paletteSize - raw)
-                if d < minDist { minDist = d }
-            }
-            if minDist > bestDist {
-                bestDist = minDist
-                bestIdx = c
-            }
-        }
-        return bestIdx
-    }
-
-    /// HSL→RGB. Combined with low saturation and high lightness this yields a
-    /// procedurally unbounded pastel palette.
-    private static func pastelRGBA(hue: CGFloat, saturation: CGFloat, lightness: CGFloat) -> RGBA {
-        let h = ((hue.truncatingRemainder(dividingBy: 1)) + 1).truncatingRemainder(dividingBy: 1)
-        let c = (1 - abs(2 * lightness - 1)) * saturation
-        let hp = h * 6
-        let x = c * (1 - abs(hp.truncatingRemainder(dividingBy: 2) - 1))
-        let m = lightness - c / 2
-        let (r1, g1, b1): (CGFloat, CGFloat, CGFloat)
-        switch hp {
-        case ..<1: (r1, g1, b1) = (c, x, 0)
-        case ..<2: (r1, g1, b1) = (x, c, 0)
-        case ..<3: (r1, g1, b1) = (0, c, x)
-        case ..<4: (r1, g1, b1) = (0, x, c)
-        case ..<5: (r1, g1, b1) = (x, 0, c)
-        default:   (r1, g1, b1) = (c, 0, x)
-        }
-        return RGBA(r: r1 + m, g: g1 + m, b: b1 + m)
+        let font = UIFont.systemFont(ofSize: style.minFontSize, weight: .medium)
+        return (font, CGSize(width: min(measured.width, avail.width),
+                             height: min(measured.height, avail.height)))
     }
 }
