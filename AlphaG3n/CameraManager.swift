@@ -21,17 +21,15 @@ import UIKit
 ///   * Session configuration starts as soon as this object is constructed if
 ///     camera access is already granted, overlapping with SwiftUI's first
 ///     render pass.
-///   * Photo capture asks AVFoundation for native JPEG, skipping the
-///     CIImage → CGImage → UIImage → jpegData round-trip that used to block
-///     the capture callback thread.
 ///   * The UI flips to `.processing` synchronously the moment the shutter is
 ///     tapped — encoding and upload happen on a detached task afterwards.
-///   * The unused per-frame video output is no longer attached; previously
-///     it delivered 30-60 FPS of `CMSampleBuffer` allocations to a no-op
-///     delegate.
+///   * Per-frame `CMSampleBuffer`s are routed through the YOLOE detector +
+///     ByteTracker so the UI can highlight a quad to perspective-correct
+///     the captured photo against before upload.
 nonisolated final class CameraManager:
     NSObject,
     ObservableObject,
+    AVCaptureVideoDataOutputSampleBufferDelegate,
     AVCapturePhotoCaptureDelegate,
     @unchecked Sendable {
 
@@ -61,6 +59,7 @@ nonisolated final class CameraManager:
     }
 
     private let photoOutput = AVCapturePhotoOutput()
+    private let videoOutput = AVCaptureVideoDataOutput()
 
     /// Serial queue for all session configuration and start/stop work, so the
     /// main thread never blocks on `startRunning()`. `.userInitiated` keeps
@@ -88,6 +87,9 @@ nonisolated final class CameraManager:
     /// Cached at construction so the hot photo path never bounces through
     /// `Bundle.main.object(forInfoDictionaryKey:)` on every shot.
     private let apiKeyConfigured = PaddleOCRClient.isAPIKeyConfigured
+
+    /// Reused to turn camera pixel buffers into JPEG data.
+    private let ciContext = CIContext()
 
     /// YOLOE-26L segmentation detector — replaces both the legacy doc-seg and
     /// the YOLOv8-world detectors. Each detection carries an oriented quad
@@ -252,18 +254,14 @@ nonisolated final class CameraManager:
         }
     }
 
-    /// Native-JPEG photo settings. Lets the ISP do the encoding so we never
-    /// pay for `CIContext.createCGImage(...)` + `UIImage.jpegData(...)` on the
-    /// AVCapture callback thread.
+    /// Requests BGRA pixels so the result is guaranteed to carry a
+    /// `CVPixelBuffer` — the perspective-correction crop in
+    /// `didCapturePhoto` reads `photo.pixelBuffer`, which is nil when the
+    /// photo is delivered as a pre-encoded JPEG.
     private func makePhotoSettings() -> AVCapturePhotoSettings {
-        let settings: AVCapturePhotoSettings
-        if photoOutput.availablePhotoCodecTypes.contains(.jpeg) {
-            settings = AVCapturePhotoSettings(format: [
-                AVVideoCodecKey: AVVideoCodecType.jpeg
-            ])
-        } else {
-            settings = AVCapturePhotoSettings()
-        }
+        let settings = AVCapturePhotoSettings(format: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
         settings.photoQualityPrioritization = .balanced
         return settings
     }
@@ -287,9 +285,18 @@ nonisolated final class CameraManager:
             session.addInput(input)
         }
 
-        // Still-photo output only. The previous per-frame video output was
-        // wired to an empty delegate, which silently burned ~30-60 FPS of
-        // sample-buffer allocations and delegate hops.
+        // Per-frame output for live detection. BGRA keeps frames consistent
+        // with captured photos.
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+        }
+
+        // Still-photo output.
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
             configurePhotoOutput(for: defaultCamera)
@@ -378,13 +385,6 @@ nonisolated final class CameraManager:
         default:
             completion(false)
         }
-    }
-
-    /// Reset back to live camera. Call from the UI when the user dismisses
-    /// the result or error overlay.
-    @MainActor
-    func resetCaptureState() {
-        captureState = .idle
     }
 
     // MARK: - OCR
