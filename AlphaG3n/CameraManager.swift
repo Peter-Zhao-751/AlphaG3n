@@ -118,11 +118,15 @@ nonisolated final class CameraManager:
         let snapshot = latestDetections
         detectionsLock.unlock()
 
-        let highlightedQuad = TrackedBox.highlightWinner(in: snapshot)
-            .flatMap { $0.normalizedQuad ?? Quad(rect: $0.normalizedRect) }
+        let winner = TrackedBox.highlightWinner(in: snapshot)
+        let paddedQuad: Quad? = winner.map { box in
+            let raw = box.normalizedQuad ?? Quad(rect: box.normalizedRect)
+            let padding = YoloEClasses.cropPadding(for: box.classId)
+            return raw.expanded(byFactor: padding)
+        }
 
         let imageData: Data? = {
-            if let quad = highlightedQuad {
+            if let quad = paddedQuad {
                 return jpegData(from: pixelBuffer, perspectiveCorrectingTo: quad)
             }
             return jpegData(from: pixelBuffer)
@@ -143,6 +147,7 @@ nonisolated final class CameraManager:
     @MainActor
     func resetCaptureState() {
         captureState = .idle
+        start()
     }
 
     // MARK: - Lifecycle
@@ -318,7 +323,11 @@ nonisolated final class CameraManager:
 
             let document = VirtualDocument.make(from: pruned, image: sourceImage)
             let overlay = document.render()
-            await MainActor.run { self.captureState = .result(overlay) }
+            let croppedImage = UIImage(data: imageData) ?? overlay
+            await MainActor.run {
+                self.captureState = .result(croppedImage)
+                self.stop()
+            }
         } catch {
             await publishFailure("PaddleOCR error: \(error)")
         }
@@ -349,8 +358,12 @@ nonisolated final class CameraManager:
     /// regardless of which corner the detector listed first.
     private func jpegData(from pixelBuffer: CVPixelBuffer,
                           perspectiveCorrectingTo quad: Quad) -> Data? {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let extent = ciImage.extent
+        let baseImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let extent = baseImage.extent
+        // Clamp to the input extent so a class with generous padding that
+        // pushes a corner slightly past the image edge samples edge pixels
+        // instead of black borders.
+        let ciImage = baseImage.clampedToExtent()
 
         // Vision-normalized (bottom-left, [0,1]) -> CIImage pixel coords (same
         // origin convention, so no Y flip).
