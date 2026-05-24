@@ -2,367 +2,322 @@
 //  ContentView.swift
 //  AlphaG3n
 //
-//  Created by Peter Zhao on 5/23/26.
+//  Top-level flow. The app launches at the Home screen with the camera OFF;
+//  tapping the LARP logo powers up the capture session and drops into the
+//  camera. From there the capture pipeline's state drives which screen shows:
+//  the live viewfinder, the "analyzing" sweep, the analysis result, or an
+//  error. The camera's close button returns Home and powers the camera back
+//  down.
+//
+//  The LARP visual language lives in LarpTheme / HomeView / AnalysisView /
+//  SentenceListView; this file owns the orchestration plus the camera,
+//  processing and failure chrome.
 //
 
 import SwiftUI
 import AVFoundation
+import UIKit
 
 struct ContentView: View {
     @StateObject private var camera = CameraManager()
 
+    /// The app opens idle on the Home screen with the camera off. Leaving Home
+    /// starts the session; the camera's close button (`goHome`) stops it.
+    @State private var atHome = true
+
     var body: some View {
+        ZStack {
+            if atHome {
+                HomeView(onEnter: enterCamera)
+                    .transition(.opacity)
+            } else {
+                cameraFlow
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: atHome)
+        // The session is owned by the camera flow, not the app's lifetime; make
+        // sure it's stopped if this view ever goes away while in-camera.
+        .onDisappear { camera.stop() }
+    }
+
+    private func enterCamera() {
+        atHome = false
+        camera.start()
+    }
+
+    private func goHome() {
+        camera.goHome()
+        atHome = true
+    }
+
+    private var cameraFlow: some View {
         ZStack {
             CameraPreview(
                 session: camera.session,
                 detections: camera.liveDetections,
                 rotationAngle: camera.previewRotationAngle
             )
-                .ignoresSafeArea()
-
-            VStack {
-                //cameraPicker
-                Spacer()
-                shutterButton
-            }
-            .padding()
+            .ignoresSafeArea()
 
             overlay
         }
-        .onAppear { camera.start() }
-        .onDisappear { camera.stop() }
     }
 
     @ViewBuilder
     private var overlay: some View {
         switch camera.captureState {
         case .idle:
-            EmptyView()
+            CameraControls(onClose: goHome, onCapture: camera.capturePhoto)
         case .processing(let image):
-            processingOverlay(image: image)
-        case .result(let image, let document, let qrCodes):
-            ResultOverlay(image: image, document: document, qrCodes: qrCodes) { camera.resetCaptureState() }
+            ProcessingOverlay(image: image, onCancel: camera.cancelProcessing)
+        case .result(let document, let qrCodes):
+            AnalysisView(
+                document: document,
+                qrCodes: qrCodes,
+                onRecapture: camera.resetCaptureState
+            )
         case .failed(let message):
-            FailureOverlay(message: message) { camera.resetCaptureState() }
+            FailureOverlay(message: message, onDismiss: camera.resetCaptureState)
         }
     }
+}
 
-    @ViewBuilder
-    private func processingOverlay(image: UIImage?) -> some View {
+// MARK: - Camera controls (live viewfinder chrome)
+
+/// The idle camera screen overlaid on the live preview: a decorative scanning
+/// reticle, a close button (top-left) back to Home, a hint line, and the
+/// full-width Capture bar. The close button and Capture bar carry the
+/// VoiceOver labels; everything else is decorative and hidden.
+private struct CameraControls: View {
+    var onClose: () -> Void
+    var onCapture: () -> Void
+
+    var body: some View {
         ZStack {
+            //CameraReticle()
+
+            VStack(spacing: 0) {
+                HStack {
+                    LarpIconButton(
+                        systemImage: "xmark",
+                        accessibilityLabel: "Close camera",
+                        accessibilityHint: "Returns to the home screen",
+                        action: onClose
+                    )
+                    Spacer()
+                }
+                .padding(.horizontal, 22)
+                .padding(.top, 8)
+
+                Spacer()
+
+                VStack(spacing: 22) {
+                    LarpHintLine(text: "Hold still — auto-detecting layout")
+                    LarpCaptureBar(action: onCapture)
+                }
+                .padding(.horizontal, 28)
+                .padding(.bottom, 44)
+            }
+        }
+    }
+}
+
+/// Brand focus reticle — orange corner brackets, pixel ticks and a "SCANNING"
+/// label that breathe gently in the center of the frame. Purely decorative.
+private struct CameraReticle: View {
+    @State private var breathe = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            LCorner().frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            LCorner().rotationEffect(.degrees(90))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            LCorner().rotationEffect(.degrees(180))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            LCorner().rotationEffect(.degrees(270))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+
+            Text("SCANNING")
+                .font(LarpTheme.mono(10))
+                .tracking(2)
+                .foregroundStyle(LarpTheme.orange)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .offset(y: -22)
+        }
+        .frame(width: 220, height: 220)
+        .overlay(PixelCorners(color: LarpTheme.orange, size: 6))
+        .scaleEffect(breathe ? 1.04 : 1)
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 3.6).repeatForever(autoreverses: true),
+            value: breathe
+        )
+        .onAppear { breathe = true }
+        .accessibilityHidden(true)
+    }
+}
+
+/// One top-left focus bracket (two short orange rules). Rotated by the reticle
+/// to make the other three corners.
+private struct LCorner: View {
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Rectangle().frame(width: 22, height: 2)
+            Rectangle().frame(width: 2, height: 22)
+        }
+        .frame(width: 22, height: 22, alignment: .topLeading)
+        .foregroundStyle(LarpTheme.orange)
+    }
+}
+
+// MARK: - Processing overlay
+
+/// Shown while OCR runs. The captured frame sits darkened behind an orange
+/// scan line that sweeps up and down, with an "Analyzing layout" caption and a
+/// top-left Cancel button that aborts the read and returns to the camera.
+private struct ProcessingOverlay: View {
+    let image: UIImage?
+    let onCancel: () -> Void
+
+    @State private var sweepDown = false
+    @State private var blink = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            LarpTheme.bg0.ignoresSafeArea()
+
             if let image {
-                // The captured frame headed to OCR — the perspective-corrected
-                // crop, or the full uncropped frame in the fallback — sits behind
-                // the spinner so the user sees exactly what's being read.
-                Color.black.ignoresSafeArea()
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    .ignoresSafeArea(edges: .bottom)
-                // Dim scrim keeps the white spinner + text legible over any image.
-                Color.black.opacity(0.45).ignoresSafeArea()
-            } else {
-                Color.black.opacity(0.55).ignoresSafeArea()
-            }
-            VStack(spacing: 16) {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white)
-                    .scaleEffect(1.4)
-                Text("Reading document…")
-                    .font(.headline)
-                    .foregroundStyle(.white)
+                    .ignoresSafeArea()
+                    .brightness(-0.25)
+                    .saturation(0.7)
+                    // Darkened backdrop only; same inert pairing as the result
+                    // screen — touch off, and out of VoiceOver (the caption and
+                    // Cancel button carry the accessibility here instead).
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                Color.black.opacity(0.35).ignoresSafeArea()
             }
 
-            TopActionBar(
-                title: "Cancel",
-                tint: .red,
-                accessibilityHint: "Stops reading the document and returns to the camera"
-            ) {
-                camera.cancelProcessing()
+            sweep
+
+            // Caption near the bottom.
+            VStack {
+                Spacer()
+                HStack(spacing: 12) {
+                    procDot
+                    Text("ANALYZING LAYOUT")
+                        .font(LarpTheme.mono(10.5))
+                        .tracking(3)
+                        .foregroundStyle(LarpTheme.orange)
+                    procDot
+                }
+                .shadow(color: .black.opacity(0.5), radius: 8)
+                .padding(.bottom, 88)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Analyzing the document layout, please wait.")
+
+            // Cancel.
+            VStack {
+                HStack {
+                    LarpIconButton(
+                        systemImage: "xmark",
+                        accessibilityLabel: "Cancel",
+                        accessibilityHint: "Stops reading the document and returns to the camera",
+                        action: onCancel
+                    )
+                    Spacer()
+                }
+                .padding(.horizontal, 22)
+                .padding(.top, 8)
+                Spacer()
             }
         }
         .transition(.opacity)
-    }
-
-    /// Lets you pick among the cameras the device actually has.
-    /// Only shown when there's more than one to choose from.
-    @ViewBuilder
-    private var cameraPicker: some View {
-        if camera.availableCameras.count > 1 {
-            Picker("Camera", selection: cameraSelection) {
-                ForEach(camera.availableCameras, id: \.uniqueID) { device in
-                    Text(device.localizedName).tag(device as AVCaptureDevice?)
-                }
-            }
-            .pickerStyle(.segmented)
+        .onAppear {
+            sweepDown = true
+            blink = true
         }
     }
 
-    private var cameraSelection: Binding<AVCaptureDevice?> {
-        Binding(
-            get: { camera.selectedCamera },
-            set: { device in if let device { camera.selectCamera(device) } }
-        )
-    }
-
-    private var shutterButton: some View {
-        Button(action: camera.capturePhoto) {
-            Circle()
-                .fill(.white)
-                .frame(width: 70, height: 70)
-                .overlay(
-                    Circle()
-                        .stroke(.white.opacity(0.6), lineWidth: 4)
-                        .padding(4)
-                )
-        }
-        .disabled(!camera.captureState.isIdle)
-        .opacity(camera.captureState.isIdle ? 1 : 0.4)
-    }
-}
-
-// MARK: - Result / failure overlays
-
-private struct ResultOverlay: View {
-    let image: UIImage
-    /// The structured document behind `image`, used to place tap targets over
-    /// text blocks. The rendered image alone is a flat bitmap with nothing to hit.
-    let document: VirtualDocument
-    /// Website-linking QR codes found on the page. Each becomes a tap target —
-    /// like a multi-sentence text block — that opens a spoken website summary.
-    let qrCodes: [DetectedQRCode]
-    let onDismiss: () -> Void
-
-    /// What the user drilled into over the document: a text block's sentences or
-    /// a QR code's website summary. Mutually exclusive; `nil` shows the document.
-    @State private var drilldown: Drilldown?
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                // Invisible buttons sit exactly over each interactive region —
-                // multi-sentence text blocks and website QR codes. The overlay's
-                // GeometryReader is sized to the fitted image, so a region's
-                // page-space rect maps in with a plain axis scale and no
-                // letterbox offset. Real Buttons, so a sighted tap and a
-                // VoiceOver double-tap both open the matching screen.
-                .overlay {
-                    GeometryReader { geo in
-                        ForEach(interactiveParts) { part in
-                            let r = screenRect(forPageRect: part.bbox, in: geo.size)
-                            Button { drilldown = .reading(part) } label: {
-                                Color.clear.contentShape(Rectangle())
-                            }
-                            .frame(width: r.width, height: r.height)
-                            .position(x: r.midX, y: r.midY)
-                            .accessibilityLabel(part.content)
-                            .accessibilityHint("Double tap to read sentence by sentence")
-                        }
-
-                        // QR codes that link to a website. Tapping fetches and
-                        // summarizes the linked page (see WebSummaryView); the
-                        // site is only visited on this tap, never at scan time.
-                        ForEach(qrCodes) { qr in
-                            let r = screenRect(forPageRect: qr.pageRect, in: geo.size)
-                            Button { drilldown = .summary(qr) } label: {
-                                Color.clear.contentShape(Rectangle())
-                            }
-                            .frame(width: r.width, height: r.height)
-                            .position(x: r.midX, y: r.midY)
-                            .accessibilityLabel("QR code linking to \(qr.url.host ?? "a website")")
-                            .accessibilityHint("Double tap to open a summary of the linked website")
-                        }
-                    }
-                }
-                .ignoresSafeArea(edges: .bottom)
-
-            TopActionBar(
-                title: "Done",
-                accessibilityHint: "Closes the scanned document and returns to the camera",
-                action: onDismiss
+    private var sweep: some View {
+        GeometryReader { geo in
+            LinearGradient(
+                stops: [
+                    .init(color: LarpTheme.orange.opacity(0), location: 0),
+                    .init(color: LarpTheme.orange.opacity(0.35), location: 0.4),
+                    .init(color: .white.opacity(0.55), location: 0.5),
+                    .init(color: LarpTheme.orange.opacity(0.35), location: 0.6),
+                    .init(color: LarpTheme.orange.opacity(0), location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 130)
+            .offset(y: sweepDown ? geo.size.height : -130)
+            .blendMode(.screen)
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 1.4).repeatForever(autoreverses: true),
+                value: sweepDown
             )
         }
-        .transition(.opacity)
-        .fullScreenCover(item: $drilldown) { item in
-            switch item {
-            case .reading(let part):
-                SentenceReadingView(
-                    sentences: SentenceSplitter.sentences(in: part.content)
-                ) { drilldown = nil }
-            case .summary(let qr):
-                WebSummaryView(url: qr.url) { drilldown = nil }
-            }
-        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
-    /// Text blocks worth drilling into: real text parts whose transcription holds
-    /// at least two sentences. Single-sentence blocks, titles, page numbers, and
-    /// image parts stay non-interactive so there are no dead-end taps.
-    private var interactiveParts: [VirtualDocument.Part] {
-        document.parts.filter { part in
-            guard case .text = part else { return false }
-            return SentenceSplitter.hasMultipleSentences(in: part.content)
-        }
-    }
-
-    /// A page-space rect in the fitted image's own coordinates. The overlay
-    /// GeometryReader is already aligned to the displayed image, so this is just
-    /// the page→view axis scale that `VirtualDocument.render()` applies. Shared
-    /// by text-block bboxes and QR-code page rects, which live in the same frame.
-    private func screenRect(forPageRect b: CGRect, in size: CGSize) -> CGRect {
-        let page = document.pageSize
-        guard page.width > 0, page.height > 0 else { return .zero }
-        let sx = size.width / page.width
-        let sy = size.height / page.height
-        return CGRect(x: b.minX * sx, y: b.minY * sy, width: b.width * sx, height: b.height * sy)
-    }
-}
-
-/// A region the user can drill into from the result screen. Mutually exclusive,
-/// so a single full-screen cover binding drives both the sentence reader and the
-/// QR website summary.
-private enum Drilldown: Identifiable {
-    case reading(VirtualDocument.Part)
-    case summary(DetectedQRCode)
-
-    var id: String {
-        switch self {
-        case .reading(let part): return "reading-\(part.id)"
-        case .summary(let qr):   return "summary-\(qr.id)"
-        }
-    }
-}
-
-// MARK: - Sentence-by-sentence reading
-
-/// Full-screen reading view for one text block: its transcription broken into
-/// sentences, each its own large, VoiceOver-focusable element so a blind user
-/// can swipe through them one at a time. Presented from a tapped block on the
-/// result screen; shown only for blocks with two or more sentences.
-private struct SentenceReadingView: View {
-    let sentences: [String]
-    let onDone: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            ScrollView {
-                VStack(spacing: 16) {
-                    ForEach(Array(sentences.enumerated()), id: \.offset) { index, sentence in
-                        Text(sentence)
-                            .font(.title3)
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(20)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-                            // One element per sentence: VoiceOver reads the text
-                            // and announces position so the user knows where they
-                            // are in the block.
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel(sentence)
-                            .accessibilityHint("Sentence \(index + 1) of \(sentences.count)")
-                    }
-                }
-                .padding(.horizontal, 20)
-                // Clear the floating top bar; breathe at the bottom.
-                .padding(.top, 96)
-                .padding(.bottom, 40)
-            }
-
-            TopActionBar(
-                title: "Done",
-                accessibilityHint: "Closes sentence reading and returns to the document",
-                action: onDone
+    private var procDot: some View {
+        Rectangle()
+            .fill(LarpTheme.orange)
+            .frame(width: 6, height: 6)
+            .opacity(blink ? 1 : 0.3)
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                value: blink
             )
-        }
     }
 }
 
+// MARK: - Failure overlay
+
+/// Shown when a read fails. A back bar returns to the camera, with the error
+/// spelled out below for VoiceOver and sighted users alike.
 private struct FailureOverlay: View {
     let message: String
     let onDismiss: () -> Void
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.7).ignoresSafeArea()
-            VStack(spacing: 20) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 44))
-                    .foregroundStyle(.yellow)
-                Text(message)
-                    .font(.body)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 32)
-            }
-            .padding()
+            LarpTheme.bg0.ignoresSafeArea()
 
-            TopActionBar(
-                title: "Dismiss",
-                tint: .red,
-                accessibilityHint: "Closes this message and returns to the camera",
-                action: onDismiss
-            )
+            VStack(spacing: 0) {
+                LarpBackBar(
+                    title: "Back",
+                    accessibilityHint: "Closes this message and returns to the camera",
+                    action: onDismiss
+                )
+                Spacer()
+                VStack(spacing: 20) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(LarpTheme.orange)
+                    Text(message)
+                        .font(.body)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(LarpTheme.ink0)
+                        .padding(.horizontal, 32)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(message)
+                Spacer()
+            }
         }
         .transition(.opacity)
-    }
-}
-
-// MARK: - Accessible top action bar
-
-/// A rounded, pill-shaped button that floats near the top of an overlay — just
-/// below the Dynamic Island and inset from the screen edges. Long and thin so
-/// it reads as an ordinary button, but still a wide, easy tap target wired for
-/// VoiceOver. Shared by the processing, result, and failure overlays — and the
-/// QR website-summary cover (WebSummaryView) — so the primary action sits in
-/// the same place on every screen.
-struct TopActionBar: View {
-    let title: String
-    /// Leading SF Symbol. Defaults to the familiar close glyph.
-    var systemImage: String = "xmark"
-    /// Button fill. Cosmetic only — VoiceOver never reads color.
-    var tint: Color = .accentColor
-    /// Spoken description of what tapping does.
-    var accessibilityHint: String
-    let action: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Button(action: action) {
-                Label(title, systemImage: systemImage)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity, minHeight: 50)
-                    .background(tint, in: Capsule())
-                    .contentShape(Rectangle())
-                    .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(title)
-            .accessibilityHint(accessibilityHint)
-            .accessibilityAddTraits(.isButton)
-            // Land VoiceOver focus here first — it's the screen's primary action.
-            .accessibilitySortPriority(1)
-
-            Spacer()
-        }
-        // Inset from the edges and nudged down so the pill sits just under the
-        // Dynamic Island rather than running to the top/side edges.
-        .padding(.horizontal, 20)
-        .padding(.top, 8)
-    }
-}
-
-private extension CameraManager.CaptureState {
-    var isIdle: Bool {
-        if case .idle = self { return true }
-        return false
     }
 }
 

@@ -2,11 +2,13 @@
 //  WebSummaryView.swift
 //  AlphaG3n
 //
-//  Full-screen cover shown when the user taps a QR code on the result screen.
-//  The sibling of SentenceReadingView: a large, VoiceOver-focusable reading
-//  surface with the shared Done bar. Visiting and summarizing the linked site
-//  happens here, on appear — so a site is fetched only when the user opens its
-//  QR — and a spinner shows for the duration.
+//  Full-screen cover shown when the user taps a website QR code on the
+//  analysis screen. The sibling of the chunk-detail reader: the same dark
+//  surface, Back-to-scan bar, and accent hero — and once the summary arrives
+//  it's split into sentences and shown through the shared `SentenceListView`,
+//  so a blind user swipes through it one sentence at a time exactly like a
+//  scanned text block. The linked site is visited and summarized here, on
+//  appear, so a site is only fetched when the user opens its QR.
 //
 
 import SwiftUI
@@ -17,21 +19,27 @@ struct WebSummaryView: View {
     let onDone: () -> Void
 
     @StateObject private var loader = WebSummaryLoader()
+    /// Drives VoiceOver onto the progress status the moment the cover opens, so
+    /// a blind user hears "Summarizing…" instead of the Back bar (see `loadingView`).
+    @AccessibilityFocusState private var loadingFocused: Bool
+
+    private var host: String { url.host ?? "the linked website" }
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            LarpTheme.bg0.ignoresSafeArea()
 
-            content
-
-            TopActionBar(
-                title: "Done",
-                accessibilityHint: "Closes the website summary and returns to the document",
-                action: onDone
-            )
+            VStack(spacing: 0) {
+                LarpBackBar(
+                    title: "Back to scan",
+                    accessibilityHint: "Closes the website summary and returns to the document",
+                    action: onDone
+                )
+                content
+            }
         }
-        // `.task` starts on appear and is cancelled automatically when the cover
-        // is dismissed, which trips the loader's cancellation guard.
+        // `.task` starts on appear and is cancelled automatically when the
+        // cover is dismissed, which trips the loader's cancellation guard.
         .task { await loader.load(url: url) }
     }
 
@@ -39,58 +47,65 @@ struct WebSummaryView: View {
     private var content: some View {
         switch loader.state {
         case .loading:
-            VStack(spacing: 16) {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white)
-                    .scaleEffect(1.4)
-                Text("Summarizing website…")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-            }
-            // Tell VoiceOver something is in progress rather than leaving a
-            // silent screen while the fetch + summary run.
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Summarizing website, please wait.")
+            loadingView
 
         case .loaded(let summary):
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if let host = url.host {
-                        Text(host)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.7))
-                            .accessibilityLabel("Summary of \(host)")
-                    }
-                    Text(summary)
-                        .font(.title3)
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(20)
-                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-                        // One focusable element holding the whole summary, like
-                        // a sentence card in SentenceReadingView.
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(summary)
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 96)
-                .padding(.bottom, 40)
+            let split = SentenceSplitter.sentences(in: summary)
+            let sentences = split.isEmpty ? [summary] : split
+            VStack(spacing: 0) {
+                ReaderHero(tagline: "Website", title: host, subtitle: "summary")
+                SentenceListView(sentences: sentences, accent: LarpTheme.orange)
             }
 
         case .failed(let message):
+            Spacer()
             VStack(spacing: 20) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 44))
-                    .foregroundStyle(.yellow)
+                    .foregroundStyle(LarpTheme.orange)
                 Text(message)
-                    .font(.title3)
+                    .font(.body)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(LarpTheme.ink0)
                     .padding(.horizontal, 32)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(message)
+            Spacer()
+        }
+    }
+
+    private var loadingView: some View {
+        VStack {
+            Spacer()
+            VStack(spacing: 16) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(LarpTheme.orange)
+                    .scaleEffect(1.4)
+                Text("SUMMARIZING WEBSITE")
+                    .font(LarpTheme.mono(11))
+                    .tracking(2.5)
+                    .foregroundStyle(LarpTheme.orange)
+                Text(host)
+                    .font(.subheadline)
+                    .foregroundStyle(LarpTheme.ink2)
+            }
+            // Tell VoiceOver something is in progress rather than leaving a
+            // silent screen while the fetch + summary run.
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Summarizing \(host), please wait.")
+            .accessibilityFocused($loadingFocused)
+            Spacer()
+        }
+        .onAppear {
+            // Mirror the post-capture "Analyzing…" screen: once the cover has
+            // settled (a fullScreenCover otherwise drops VoiceOver on the Back
+            // bar above), pull focus onto the progress status so it speaks the
+            // wait message immediately.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                loadingFocused = true
+            }
         }
     }
 }

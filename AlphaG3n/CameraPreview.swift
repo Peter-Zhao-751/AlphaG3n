@@ -46,30 +46,29 @@ struct CameraPreview: UIViewRepresentable {
         /// `[highlightMinAreaFraction, highlightMaxAreaFraction]` of the frame
         /// AND every edge is at least `highlightEdgePadding` away from the
         /// frame's edges. If multiple boxes qualify on the same frame, only
-        /// the single largest one is rendered red — the others stay cyan.
-        var highlightMinAreaFraction: CGFloat = 0.20
+        /// the single largest one is rendered.
+        var highlightMinAreaFraction: CGFloat = 0.10
         var highlightMaxAreaFraction: CGFloat = 0.75
         var highlightEdgePadding: CGFloat = 0.03
-
-        private let regularLayer: CAShapeLayer = {
-            let l = CAShapeLayer()
-            l.fillColor = nil
-            l.strokeColor = UIColor.systemCyan.cgColor
-            l.lineWidth = 2
-            return l
-        }()
         private let highlightLayer: CAShapeLayer = {
             let l = CAShapeLayer()
             l.fillColor = nil
-            l.strokeColor = UIColor.systemRed.cgColor
-            l.lineWidth = 3
+            l.strokeColor = UIColor(LarpTheme.orange).cgColor
+            // Match the result-view detection boxes: same orange, the same 2pt
+            // weight, and crisp (mitered) corners instead of rounded ones.
+            l.lineWidth = 2
+            l.lineCap = .butt
+            l.lineJoin = .miter
             return l
         }()
+        /// The crosshair brackets trace a box this much larger than the tracked
+        /// region, so the corners sit outside the content with a clear margin.
+        /// 0.10 → the traced box is 10% larger (≈5% added on each side).
+        private let crosshairBoxMargin: CGFloat = 0.10
         private var lastDetections: [TrackedBox] = []
 
         override init(frame: CGRect) {
             super.init(frame: frame)
-            layer.addSublayer(regularLayer)
             layer.addSublayer(highlightLayer)
         }
 
@@ -77,7 +76,6 @@ struct CameraPreview: UIViewRepresentable {
 
         override func layoutSubviews() {
             super.layoutSubviews()
-            regularLayer.frame = bounds
             highlightLayer.frame = bounds
             rebuildPath()
         }
@@ -101,23 +99,16 @@ struct CameraPreview: UIViewRepresentable {
         }
 
         private func rebuildPath() {
-            // Pick the single largest qualifying box (if any) for the red
-            // highlight; everyone else — including other qualifying boxes —
-            // renders as regular cyan.
+            // Pick the single largest qualifying box (if any) for the accent
+            // highlight. Other tracked boxes stay tracked but are not rendered.
             let winnerIdx = pickHighlightIndex(lastDetections)
-
-            let regular = UIBezierPath()
             let highlight = UIBezierPath()
-            for (i, detection) in lastDetections.enumerated() {
-                let target = (i == winnerIdx) ? highlight : regular
-                // Upright rect overlay; the oriented quad is kept on the
-                // detection for capture-time perspective correction only.
-                target.append(rectPath(detection.normalizedRect))
+            if let winnerIdx {
+                highlight.append(cornerCrosshairPath(for: lastDetections[winnerIdx]))
             }
             // Avoid the implicit animation on `path` so the boxes track frames cleanly.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            regularLayer.path = regular.cgPath
             highlightLayer.path = highlight.cgPath
             CATransaction.commit()
         }
@@ -150,17 +141,62 @@ struct CameraPreview: UIViewRepresentable {
             )
         }
 
-        private func rectPath(_ visionRect: CGRect) -> UIBezierPath {
-            // Vision rect: bottom-left origin. Metadata rect (what
-            // `layerRectConverted` wants): top-left origin. Flip Y.
-            let metadataRect = CGRect(
-                x: visionRect.minX,
-                y: 1 - visionRect.minY - visionRect.height,
-                width: visionRect.width,
-                height: visionRect.height
-            )
-            let viewRect = videoPreviewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
-            return UIBezierPath(rect: viewRect)
+        private func cornerCrosshairPath(for detection: TrackedBox) -> UIBezierPath {
+            let quad = (detection.normalizedQuad ?? Quad(rect: detection.normalizedRect))
+                .expanded(byFactor: crosshairBoxMargin)
+            let viewPoints = quad.points.map(viewPoint(fromVisionPoint:))
+            return cornerCrosshairPath(points: viewPoints)
+        }
+
+        private func cornerCrosshairPath(points: [CGPoint]) -> UIBezierPath {
+            let path = UIBezierPath()
+            guard points.count == 4 else { return path }
+
+            let edgeLengths = (0..<4).map { i in
+                distance(points[i], points[(i + 1) % 4])
+            }
+            let minEdge = edgeLengths.min() ?? 0
+            let armLength = max(12, min(32, minEdge * 0.35))
+
+            for i in 0..<4 {
+                let corner = points[i]
+                let prev = points[(i + 3) % 4]
+                let next = points[(i + 1) % 4]
+                // Draw each bracket as one bent stroke (prevEnd → corner → nextEnd)
+                // so the mitered lineJoin renders a sharp right-angle corner — the
+                // same crisp corner the result-view boxes have. Two separate arms
+                // would instead meet as two independently capped segments.
+                path.move(to: armEnd(from: corner, toward: prev, length: armLength))
+                path.addLine(to: corner)
+                path.addLine(to: armEnd(from: corner, toward: next, length: armLength))
+            }
+            return path
+        }
+
+        private func armEnd(
+            from corner: CGPoint,
+            toward neighbor: CGPoint,
+            length: CGFloat
+        ) -> CGPoint {
+            let dx = neighbor.x - corner.x
+            let dy = neighbor.y - corner.y
+            let edgeLength = hypot(dx, dy)
+            guard edgeLength > 0.001 else { return corner }
+
+            let clampedLength = min(length, edgeLength * 0.45)
+            let scale = clampedLength / edgeLength
+            return CGPoint(x: corner.x + dx * scale, y: corner.y + dy * scale)
+        }
+
+        private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            hypot(b.x - a.x, b.y - a.y)
+        }
+
+        private func viewPoint(fromVisionPoint point: CGPoint) -> CGPoint {
+            // Vision point: bottom-left origin. Capture-device point expects
+            // top-left origin, so flip Y before converting to view space.
+            let capturePoint = CGPoint(x: point.x, y: 1 - point.y)
+            return videoPreviewLayer.layerPointConverted(fromCaptureDevicePoint: capturePoint)
         }
     }
 }

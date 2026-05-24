@@ -68,12 +68,11 @@ nonisolated final class CameraManager:
     enum CaptureState: @unchecked Sendable {
         case idle
         case processing(UIImage?)
-        /// The finished overlay image plus the structured document behind it, so
-        /// the result screen can place tappable targets over each text block and
-        /// drill into its sentences. The image alone can't be hit-tested. The
-        /// trailing array carries any website-linking QR codes found on the page,
-        /// each a tap target that opens a spoken summary of the linked site.
-        case result(UIImage, VirtualDocument, [DetectedQRCode])
+        /// The structured document for the scanned page plus any website-linking
+        /// QR codes. The analysis screen draws the raw photo (`document.image`)
+        /// and overlays tappable, color-coded boxes over each interactive text
+        /// block and QR code — so no pre-rendered overlay bitmap is carried here.
+        case result(VirtualDocument, [DetectedQRCode])
         case failed(String)
     }
 
@@ -262,6 +261,20 @@ nonisolated final class CameraManager:
         ocrTask?.cancel()
         ocrTask = nil
         resetCaptureState()
+    }
+
+    /// Leave the camera flow entirely: abort any in-flight read, drop back to
+    /// the idle state, and stop the session so the camera powers down. Called
+    /// when the user taps the camera's close button to return to the home
+    /// screen — the app launches there with the camera off, and this restores
+    /// that state. Unlike `resetCaptureState`, it does *not* restart the
+    /// session; entering the camera again from home calls `start()`.
+    @MainActor
+    func goHome() {
+        ocrTask?.cancel()
+        ocrTask = nil
+        captureState = .idle
+        stop()
     }
 
     // MARK: - Lifecycle
@@ -692,22 +705,23 @@ nonisolated final class CameraManager:
 
             guard !Task.isCancelled else { return }
 
-            // Document build + render is pure CPU work; offload so this method
-            // returns to its caller as fast as possible. On dense pages this is
-            // 50-200 ms of layout sort + text/path drawing. QR detection rides
-            // along on the same hop: it's on-device Vision over the render
-            // source (no network — the linked site is only fetched if the user
-            // taps the QR later), and only QRs linking to a website are kept.
-            let (overlay, document, qrCodes) = await Task.detached(priority: .userInitiated) { () -> (UIImage, VirtualDocument, [DetectedQRCode]) in
+            // Document build is pure CPU work; offload so this method returns to
+            // its caller as fast as possible. On dense pages this is 50-200 ms of
+            // layout sort. QR detection rides along on the same hop: it's
+            // on-device Vision over the render source (no network — the linked
+            // site is only fetched if the user taps the QR later), and only QRs
+            // linking to a website are kept. The analysis screen draws the boxes
+            // itself over `document.image`, so nothing is rasterized to a bitmap.
+            let (document, qrCodes) = await Task.detached(priority: .userInitiated) { () -> (VirtualDocument, [DetectedQRCode]) in
                 let document = VirtualDocument.make(from: prepared, image: renderSource)
                 let qrCodes = QRCodeDetector.detect(in: renderSource, pageSize: document.pageSize)
-                return (document.render(), document, qrCodes)
+                return (document, qrCodes)
             }.value
 
             guard !Task.isCancelled else { return }
 
             await MainActor.run {
-                self.captureState = .result(overlay, document, qrCodes)
+                self.captureState = .result(document, qrCodes)
                 self.stop()
                 self.ocrTask = nil
             }

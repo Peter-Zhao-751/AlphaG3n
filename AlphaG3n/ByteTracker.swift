@@ -206,7 +206,7 @@ extension TrackedBox {
     /// view, not clipped. Defaults mirror `CameraPreview.PreviewView`.
     static func isHighlightCandidate(
         _ normalizedRect: CGRect,
-        minAreaFraction: CGFloat = 0.20,
+        minAreaFraction: CGFloat = 0.10,
         maxAreaFraction: CGFloat = 0.75,
         edgePadding: CGFloat = 0.03
     ) -> Bool {
