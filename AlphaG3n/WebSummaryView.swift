@@ -19,13 +19,14 @@ struct WebSummaryView: View {
     let onDone: () -> Void
 
     @StateObject private var loader = WebSummaryLoader()
-    /// Drives VoiceOver onto the progress status the moment the cover opens, so
-    /// a blind user hears "Summarizing…" instead of the Back bar (see `loadingView`).
-    @AccessibilityFocusState private var loadingFocused: Bool
-    /// Drives VoiceOver onto the website-name hero once the summary arrives, so a
-    /// blind user hears which site this is before swiping into its sentences —
-    /// again instead of the Back bar (see the `.loaded` case).
-    @AccessibilityFocusState private var summaryFocused: Bool
+    /// Holds the Back bar out of VoiceOver across each focus hand-off (the cover
+    /// opening, then the summary or error swapping in) so VoiceOver never half-
+    /// speaks "Back to scan" before the focus above settles. Re-armed on every
+    /// loader-state change; see `deferBackChrome`.
+    @State private var backChromeHidden = true
+    /// Invalidates an in-flight reveal when the chrome is re-hidden, so an early
+    /// reveal can't fire during a later hand-off.
+    @State private var revealGeneration = 0
 
     private var host: String { url.host ?? "the linked website" }
 
@@ -39,12 +40,30 @@ struct WebSummaryView: View {
                     accessibilityHint: "Closes the website summary and returns to the document",
                     action: onDone
                 )
+                .accessibilityHidden(backChromeHidden)
                 content
             }
         }
         // `.task` starts on appear and is cancelled automatically when the
         // cover is dismissed, which trips the loader's cancellation guard.
         .task { await loader.load(url: url) }
+        // Re-arm the Back-bar hold whenever the loader moves between states (the
+        // initial loading, then loaded / failed) so each focus hand-off is
+        // covered. Fires immediately with the current state on subscribe.
+        .onReceive(loader.$state) { _ in deferBackChrome() }
+    }
+
+    /// Hides the Back bar from VoiceOver, then restores it once the focus
+    /// hand-off has settled — it stays visible on screen throughout, so a sighted
+    /// user (and, after the brief hold, VoiceOver swipes) can still use it. Each
+    /// call supersedes any pending reveal via `revealGeneration`.
+    private func deferBackChrome() {
+        backChromeHidden = true
+        revealGeneration += 1
+        let generation = revealGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            if generation == revealGeneration { backChromeHidden = false }
+        }
     }
 
     @ViewBuilder
@@ -58,18 +77,11 @@ struct WebSummaryView: View {
             let sentences = split.isEmpty ? [summary] : split
             VStack(spacing: 0) {
                 ReaderHero(tagline: "Website", title: host, subtitle: "summary")
-                    .accessibilityFocused($summaryFocused)
-                // The list leaves its own appear-focus off (the default) so it
-                // doesn't fight the hero above for VoiceOver; the user swipes
-                // down into the sentences from there.
+                // With the Back bar held out of VoiceOver during the loaded
+                // hand-off (see `deferBackChrome`), the hero is the first element
+                // VoiceOver reaches — the website name — then the user swipes
+                // down into the sentences.
                 SentenceListView(sentences: sentences, accent: LarpTheme.orange)
-            }
-            .onAppear {
-                // Mirror the loading focus: once the summary swaps in, pull
-                // VoiceOver onto the website-name hero rather than the Back bar.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    summaryFocused = true
-                }
             }
 
         case .failed(let message):
@@ -110,17 +122,7 @@ struct WebSummaryView: View {
             // silent screen while the fetch + summary run.
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Summarizing \(host), please wait.")
-            .accessibilityFocused($loadingFocused)
             Spacer()
-        }
-        .onAppear {
-            // Mirror the post-capture "Analyzing…" screen: once the cover has
-            // settled (a fullScreenCover otherwise drops VoiceOver on the Back
-            // bar above), pull focus onto the progress status so it speaks the
-            // wait message immediately.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                loadingFocused = true
-            }
         }
     }
 }

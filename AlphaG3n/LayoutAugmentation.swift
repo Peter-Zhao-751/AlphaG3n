@@ -4,9 +4,11 @@
 //
 //  Merges CRAFT-detected text regions into a PaddleOCR `PrunedResult`,
 //  keeping only the CRAFT boxes that don't substantially overlap an
-//  existing Baidu block. Catches text Baidu missed — CRAFT is sensitive
-//  to character-level regions but doesn't transcribe, so the survivors
-//  enter the document with empty content for now.
+//  existing Baidu *text* block. Figures / images / charts are skipped: the
+//  API never transcribes them, so CRAFT text buried inside a figure is kept
+//  rather than silently dropped. Catches text Baidu missed — CRAFT is
+//  sensitive to character-level regions but doesn't transcribe, so the
+//  survivors enter the document with empty content for now.
 //
 
 import Foundation
@@ -14,10 +16,12 @@ import CoreGraphics
 
 public enum LayoutAugmentation {
 
-    /// Default coverage threshold. A CRAFT box is dropped when either:
+    /// Default coverage threshold. A CRAFT box is dropped when, against the
+    /// Baidu *text* blocks (figures/images are not considered — see
+    /// `extraBlocks`), either:
     ///   * `intersection / area(craft) ≥ threshold` (CRAFT box is mostly
-    ///     redrawing a Baidu block, possibly across multiple of them), or
-    ///   * any single Baidu box is itself ≥ `threshold` covered by the
+    ///     redrawing a Baidu text block, possibly across multiple of them), or
+    ///   * any single Baidu text box is itself ≥ `threshold` covered by the
     ///     CRAFT box (CRAFT swallowed a Baidu detection).
     /// 0.6 sits in a sweet spot: tight enough to discard obvious dupes,
     /// loose enough to keep CRAFT boxes that genuinely extend past Baidu's
@@ -47,10 +51,19 @@ public enum LayoutAugmentation {
     ) -> [VirtualDocument.PrunedResult.RawBlock] {
         guard !craftBoxes.isEmpty else { return [] }
 
-        let baiduRects = existing.map { Self.rect(fromBbox: $0.blockBbox) }
+        // Only blocks the OCR API will itself transcribe (text, titles, tables,
+        // …) may suppress a CRAFT box — there a CRAFT detection is a genuine
+        // duplicate. Figures / images / charts are never transcribed, so CRAFT
+        // text that lands inside one is text the page would otherwise lose; let
+        // it survive. (The id/group bases below still derive from *all* existing
+        // blocks, so a new block id can't collide with a figure's.)
+        let textRects = existing
+            .filter { VirtualDocument.readableTextLabels.contains(
+                VirtualDocument.BlockLabel(apiValue: $0.blockLabel)) }
+            .map { Self.rect(fromBbox: $0.blockBbox) }
         let survivors = filterSurvivors(
             craftBoxes: craftBoxes,
-            against: baiduRects,
+            against: textRects,
             pageSize: pageSize,
             threshold: coverageThreshold
         )

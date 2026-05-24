@@ -49,6 +49,12 @@ struct ContentView: View {
     private func goHome() {
         camera.goHome()
         atHome = true
+        // Quitting the camera should land VoiceOver on Home's LARP button (its
+        // only control), not nowhere. Once the swap settles, a screen-changed
+        // post sends focus to the new screen's first element.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            UIAccessibility.post(notification: .screenChanged, argument: nil)
+        }
     }
 
     private var cameraFlow: some View {
@@ -93,12 +99,6 @@ private struct CameraControls: View {
     var onClose: () -> Void
     var onCapture: () -> Void
 
-    /// Pulls VoiceOver onto the Capture button whenever the live viewfinder
-    /// appears — most importantly when returning here from the analysis screen
-    /// (a state-driven swap that otherwise leaves focus stranded), but also on
-    /// first entry, where Capture is the screen's primary action.
-    @AccessibilityFocusState private var captureFocused: Bool
-
     var body: some View {
         ZStack {
             //CameraReticle()
@@ -112,6 +112,9 @@ private struct CameraControls: View {
                         scale: 1.5,
                         action: onClose
                     )
+                    // Held out of VoiceOver as the viewfinder appears so focus
+                    // lands on Capture below, not this top-left Close button.
+                    .voiceOverDeferredEntry()
                     Spacer()
                 }
                 .padding(.horizontal, 22)
@@ -122,18 +125,9 @@ private struct CameraControls: View {
                 VStack(spacing: 22) {
                     LarpHintLine(text: "Hold still — auto-detecting layout")
                     LarpCaptureBar(action: onCapture)
-                        .accessibilityFocused($captureFocused)
                 }
                 .padding(.horizontal, 28)
                 .padding(.bottom, 44)
-            }
-        }
-        // The brief delay lets the swap from the analysis screen settle so
-        // VoiceOver doesn't re-home onto the Close button (top-left) after we
-        // move focus — the same timing the reader/summary screens use.
-        .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                captureFocused = true
             }
         }
     }
@@ -144,6 +138,10 @@ private struct CameraControls: View {
 private struct CameraReticle: View {
     @State private var breathe = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // Gate looping motion on VoiceOver too, not just Reduce Motion: a
+    // repeatForever animation never lets the view tree settle, which makes
+    // VoiceOver re-announce the focused element on a loop (see HomeView).
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     var body: some View {
         ZStack {
@@ -166,7 +164,7 @@ private struct CameraReticle: View {
         .overlay(PixelCorners(color: LarpTheme.orange, size: 6))
         .scaleEffect(breathe ? 1.04 : 1)
         .animation(
-            reduceMotion ? nil : .easeInOut(duration: 3.6).repeatForever(autoreverses: true),
+            (reduceMotion || voiceOverEnabled) ? nil : .easeInOut(duration: 3.6).repeatForever(autoreverses: true),
             value: breathe
         )
         .onAppear { breathe = true }
@@ -196,8 +194,10 @@ private struct ProcessingOverlay: View {
     let image: UIImage?
     let onCancel: () -> Void
 
-    @State private var sweepDown = false
-    @State private var blink = false
+    // Reduce Motion is the only switch now: it parks the scan line and freezes
+    // the caption dots. VoiceOver no longer gates them — they're driven by Core
+    // Animation (see `ProcessingScanLine`), which keeps the perpetual motion off
+    // the SwiftUI/accessibility tree so it can't disturb VoiceOver.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -205,32 +205,34 @@ private struct ProcessingOverlay: View {
             LarpTheme.bg0.ignoresSafeArea()
 
             if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
+                // Darkened backdrop only; the caption and Cancel button carry
+                // the accessibility here. `InertPhoto` keeps it inert to touch
+                // *and* VoiceOver at the UIKit layer (see its definition) — the
+                // result screen uses the same backdrop. Dim + desaturation are
+                // unchanged; the fill frame mirrors the old `scaledToFit`.
+                InertPhoto(image: image)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea()
                     .brightness(-0.25)
                     .saturation(0.7)
-                    // Darkened backdrop only; same inert pairing as the result
-                    // screen — touch off, and out of VoiceOver (the caption and
-                    // Cancel button carry the accessibility here instead).
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
                 Color.black.opacity(0.35).ignoresSafeArea()
             }
 
-            sweep
+            ProcessingScanLine(animated: !reduceMotion)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
 
             // Caption near the bottom.
             VStack {
                 Spacer()
                 HStack(spacing: 12) {
-                    procDot
+                    ProcessingDot(animated: !reduceMotion).frame(width: 6, height: 6)
                     Text("ANALYZING LAYOUT")
                         .font(LarpTheme.mono(10.5))
                         .tracking(3)
                         .foregroundStyle(LarpTheme.orange)
-                    procDot
+                    ProcessingDot(animated: !reduceMotion).frame(width: 6, height: 6)
                 }
                 .shadow(color: .black.opacity(0.5), radius: 8)
                 .padding(.bottom, 88)
@@ -255,47 +257,143 @@ private struct ProcessingOverlay: View {
             }
         }
         .transition(.opacity)
-        .onAppear {
-            sweepDown = true
-            blink = true
-        }
+    }
+}
+
+// MARK: - Core-Animation scan motion (VoiceOver-safe)
+
+/// The orange band that sweeps up and down over the darkened capture while OCR
+/// runs. Backed by Core Animation so the perpetual motion lives on the render
+/// server and never re-renders the SwiftUI view tree — which is what let a
+/// SwiftUI `repeatForever` animation keep the tree from settling and make
+/// VoiceOver re-announce the "Analyzing layout" caption on a loop. It can
+/// therefore run with VoiceOver active. Purely decorative → out of the a11y tree.
+private struct ProcessingScanLine: UIViewRepresentable {
+    /// False under Reduce Motion → the band parks off-screen (no sweep).
+    var animated: Bool
+
+    func makeUIView(context: Context) -> ScanLineUIView {
+        let view = ScanLineUIView()
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        return view
     }
 
-    private var sweep: some View {
-        GeometryReader { geo in
-            LinearGradient(
-                stops: [
-                    .init(color: LarpTheme.orange.opacity(0), location: 0),
-                    .init(color: LarpTheme.orange.opacity(0.35), location: 0.4),
-                    .init(color: .white.opacity(0.55), location: 0.5),
-                    .init(color: LarpTheme.orange.opacity(0.35), location: 0.6),
-                    .init(color: LarpTheme.orange.opacity(0), location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 130)
-            .offset(y: sweepDown ? geo.size.height : -130)
-            .blendMode(.screen)
-            .animation(
-                reduceMotion ? nil : .easeInOut(duration: 1.4).repeatForever(autoreverses: true),
-                value: sweepDown
-            )
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+    func updateUIView(_ uiView: ScanLineUIView, context: Context) {
+        uiView.animating = animated
+    }
+}
+
+/// UIView backing `ProcessingScanLine`: a full-width gradient band whose
+/// vertical position Core Animation drives from just above the top edge to just
+/// below the bottom and back, easing in/out, forever.
+private final class ScanLineUIView: UIView {
+    private let band = CAGradientLayer()
+    private static let bandHeight: CGFloat = 130
+    private static let key = "scanSweep"
+
+    var animating = false {
+        didSet { if animating != oldValue { reseat() } }
     }
 
-    private var procDot: some View {
-        Rectangle()
-            .fill(LarpTheme.orange)
-            .frame(width: 6, height: 6)
-            .opacity(blink ? 1 : 0.3)
-            .animation(
-                reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
-                value: blink
-            )
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        let orange = UIColor(red: 1, green: 177 / 255, blue: 74 / 255, alpha: 1) // #FFB14A
+        band.colors = [
+            orange.withAlphaComponent(0).cgColor,
+            orange.withAlphaComponent(0.35).cgColor,
+            UIColor.white.withAlphaComponent(0.55).cgColor,
+            orange.withAlphaComponent(0.35).cgColor,
+            orange.withAlphaComponent(0).cgColor,
+        ]
+        band.locations = [0, 0.4, 0.5, 0.6, 1]
+        band.startPoint = CGPoint(x: 0.5, y: 0)
+        band.endPoint = CGPoint(x: 0.5, y: 1)
+        band.compositingFilter = "screenBlendMode" // ≈ SwiftUI .blendMode(.screen)
+        layer.addSublayer(band)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        band.bounds = CGRect(x: 0, y: 0, width: bounds.width, height: Self.bandHeight)
+        band.position.x = bounds.midX
+        CATransaction.commit()
+        reseat() // re-fit the sweep to the current height (first layout, rotation)
+    }
+
+    /// (Re)installs or removes the perpetual sweep for the current state/bounds.
+    private func reseat() {
+        band.removeAnimation(forKey: Self.key)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        band.position.y = -Self.bandHeight / 2 // parked just above the top edge
+        CATransaction.commit()
+        guard animating, bounds.height > 0 else { return }
+        let sweep = CABasicAnimation(keyPath: "position.y")
+        sweep.fromValue = -Self.bandHeight / 2
+        sweep.toValue = bounds.height + Self.bandHeight / 2
+        sweep.duration = 1.4
+        sweep.autoreverses = true
+        sweep.repeatCount = .infinity
+        sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        band.add(sweep, forKey: Self.key)
+    }
+}
+
+/// A small orange square that pulses while OCR runs — the dots flanking the
+/// "Analyzing layout" caption. Core-Animation-driven for the same reason as
+/// `ProcessingScanLine`, so it can pulse with VoiceOver active without keeping
+/// the SwiftUI tree from settling. Decorative; hidden from accessibility.
+private struct ProcessingDot: UIViewRepresentable {
+    /// False under Reduce Motion → the dot holds steady at full opacity.
+    var animated: Bool
+
+    func makeUIView(context: Context) -> DotUIView {
+        let view = DotUIView()
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        return view
+    }
+
+    func updateUIView(_ uiView: DotUIView, context: Context) {
+        uiView.animating = animated
+    }
+}
+
+/// UIView backing `ProcessingDot`: a solid orange square whose opacity Core
+/// Animation pulses between 0.3 and 1, easing in/out, forever.
+private final class DotUIView: UIView {
+    private static let key = "blink"
+
+    var animating = false {
+        didSet { if animating != oldValue { reseat() } }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor(red: 1, green: 177 / 255, blue: 74 / 255, alpha: 1) // #FFB14A
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func reseat() {
+        layer.removeAnimation(forKey: Self.key)
+        layer.opacity = 1
+        guard animating else { return }
+        let blink = CABasicAnimation(keyPath: "opacity")
+        blink.fromValue = 0.3
+        blink.toValue = 1.0
+        blink.duration = 0.9
+        blink.autoreverses = true
+        blink.repeatCount = .infinity
+        blink.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(blink, forKey: Self.key)
     }
 }
 

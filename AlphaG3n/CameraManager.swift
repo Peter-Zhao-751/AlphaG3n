@@ -195,8 +195,10 @@ nonisolated final class CameraManager:
 
         // Sensor-native quad coords (the videoOutput is intentionally not
         // rotated) line up with the sensor-native pixel buffer below, so the
-        // perspective-correction math stays simple; the user-facing
-        // orientation is applied via the UIImage tag at encode time.
+        // perspective-correction math stays simple. The user-facing orientation
+        // is applied at encode time: the full-frame path stamps the EXIF tag
+        // (`orientation`), while the crop path labels its corners against the
+        // device hold-angle (`angle`) so the crop comes out the way it was framed.
         rotationLock.lock()
         let angle = _sessionRotationAngle
         rotationLock.unlock()
@@ -211,7 +213,8 @@ nonisolated final class CameraManager:
 
         let imageData: Data? = {
             if let quad = paddedQuad {
-                return jpegData(from: pixelBuffer, perspectiveCorrectingTo: quad, orientation: orientation)
+                return jpegData(from: pixelBuffer, perspectiveCorrectingTo: quad,
+                                deviceAngle: angle, orientation: orientation)
             }
             return jpegData(from: pixelBuffer, orientation: orientation)
         }()
@@ -713,7 +716,11 @@ nonisolated final class CameraManager:
             // linking to a website are kept. The analysis screen draws the boxes
             // itself over `document.image`, so nothing is rasterized to a bitmap.
             let (document, qrCodes) = await Task.detached(priority: .userInitiated) { () -> (VirtualDocument, [DetectedQRCode]) in
-                let document = VirtualDocument.make(from: prepared, image: renderSource)
+                // Drop figure boxes the OCR overlaps with real text (the layout
+                // detector sometimes boxes a text region as a figure); they'd
+                // otherwise show as redundant overlay boxes and VoiceOver elements.
+                let cleaned = FigureSuppression.removingFiguresOverlappingText(prepared)
+                let document = VirtualDocument.make(from: cleaned, image: renderSource)
                 let qrCodes = QRCodeDetector.detect(in: renderSource, pageSize: document.pageSize)
                 return (document, qrCodes)
             }.value
@@ -871,13 +878,28 @@ nonisolated final class CameraManager:
                 VirtualDocument.BlockLabel(apiValue: block.blockLabel))
     }
 
-    /// Crops every text-class block, reads the crops concurrently through
-    /// `OpenAIClient.readText`, and returns a new `PrunedResult` where:
+    /// Whether a block is a figure captioned by `OpenAIClient.describeFigures`
+    /// (image / header_image / footer_image / chart / seal — see
+    /// `VirtualDocument.figureLabels`) rather than OCR'd. Disjoint from
+    /// `isReadableTextBlock`: figure labels are never readable-text labels, and
+    /// CRAFT boxes arrive labeled "text", so no block is ever both.
+    static func isFigureBlock(_ block: VirtualDocument.PrunedResult.RawBlock) -> Bool {
+        VirtualDocument.figureLabels.contains(
+            VirtualDocument.BlockLabel(apiValue: block.blockLabel))
+    }
+
+    /// Crops every text-class block AND every figure block, processes them
+    /// concurrently through OpenAI in a single pass — text via `readText`
+    /// (transcription), figures via `describeFigures` (a concise low-detail
+    /// caption that deliberately ignores any text inside the figure) — and
+    /// returns a new `PrunedResult` where:
     ///   • readable text blocks keep their box and carry the transcription,
     ///   • non-readable text blocks (empty / blurry / irrelevant / failed /
-    ///     un-croppable) are dropped entirely, and
-    ///   • graphics + `unknown` blocks pass through untouched (colored box, no
-    ///     text).
+    ///     un-croppable) are dropped entirely,
+    ///   • figure blocks (see `VirtualDocument.figureLabels`) keep their box and
+    ///     carry a caption when one came back — figures are NEVER dropped, so the
+    ///     overlay always shows every detected region, and
+    ///   • `unknown` blocks pass through untouched (colored box, no text).
     /// Original block order is preserved. With no API key configured the input
     /// is returned unchanged, so the overlay still shows type-colored boxes.
     private static func applyOCRReadings(
@@ -890,18 +912,21 @@ nonisolated final class CameraManager:
             return pruned
         }
 
-        let textBlocks = pruned.parsingResList.filter(isReadableTextBlock)
-        guard !textBlocks.isEmpty else { return pruned }
-
-        let crops = BoundingBoxCropper.croppedJPEGs(
+        let textCrops = BoundingBoxCropper.croppedJPEGs(
             of: image,
-            blocks: textBlocks,
+            blocks: pruned.parsingResList.filter(isReadableTextBlock),
             margin: margin,
             quality: cropJPEGQuality
         )
-        // No crop succeeded → no text block can be confirmed readable → drop
-        // them all, keeping only the graphics boxes.
-        guard !crops.isEmpty else {
+        let figureCrops = BoundingBoxCropper.croppedJPEGs(
+            of: image,
+            blocks: pruned.parsingResList.filter(isFigureBlock),
+            margin: margin,
+            quality: cropJPEGQuality
+        )
+        // Nothing croppable at all → no readings to apply. Drop unconfirmed text
+        // blocks (can't prove they're readable); keep figures/graphics as-is.
+        guard !textCrops.isEmpty || !figureCrops.isEmpty else {
             return VirtualDocument.PrunedResult(
                 width: pruned.width,
                 height: pruned.height,
@@ -911,28 +936,51 @@ nonisolated final class CameraManager:
 
         let client = OpenAIClient(apiKey: apiKey)
         let start = Date()
-        let results = await client.readText(in: crops.map(\.jpeg))
+        // Read text and caption figures in the SAME pass, concurrently, so the
+        // single spinner-up wait covers both batches. Each call no-ops (returns
+        // []) on an empty crop list, so an all-text or all-figure page is fine.
+        async let textResultsTask = client.readText(in: textCrops.map(\.jpeg))
+        async let figureResultsTask = client.describeFigures(in: figureCrops.map(\.jpeg))
+        let textResults = await textResultsTask
+        let figureResults = await figureResultsTask
         let elapsed = Date().timeIntervalSince(start)
 
-        // Match each readable crop back to its block id → transcription.
+        // Match each readable text crop back to its block id → transcription.
         var readableText: [Int: String] = [:]
-        for (crop, result) in zip(crops, results) {
+        for (crop, result) in zip(textCrops, textResults) {
             if case .success(let reading) = result, reading.status == .readable {
                 let trimmed = reading.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { readableText[crop.block.blockId] = trimmed }
             }
         }
 
+        // Match each figure crop back to its block id → caption (non-empty only).
+        var figureCaptions: [Int: String] = [:]
+        for (crop, result) in zip(figureCrops, figureResults) {
+            if case .success(let caption) = result, !caption.isEmpty {
+                figureCaptions[crop.block.blockId] = caption
+            }
+        }
+
         printReadings(
-            boxes: crops.map(\.block),
-            results: results,
+            boxes: textCrops.map(\.block),
+            results: textResults,
             totalBlocks: pruned.parsingResList.count,
             elapsed: elapsed
         )
+        printFigureCaptions(boxes: figureCrops.map(\.block), results: figureResults)
 
-        // Rebuild in original order: readable text blocks carry their reading,
-        // non-readable text blocks vanish, everything else passes through.
+        // Rebuild in original order:
+        //   • figure blocks keep their box, gaining a caption when one came back
+        //     (never dropped — every detected region stays on the overlay),
+        //   • readable text blocks carry their reading,
+        //   • non-readable text blocks vanish,
+        //   • everything else (e.g. `unknown`) passes through.
         let kept = pruned.parsingResList.compactMap { block -> VirtualDocument.PrunedResult.RawBlock? in
+            if isFigureBlock(block) {
+                guard let caption = figureCaptions[block.blockId] else { return block }
+                return block.settingFigureDescription(caption)
+            }
             guard isReadableTextBlock(block) else { return block }
             guard let text = readableText[block.blockId] else { return nil }
             return block.replacingContent(text)
@@ -943,6 +991,41 @@ nonisolated final class CameraManager:
             height: pruned.height,
             parsingResList: kept
         )
+    }
+
+    /// Prints one line per figure crop matched to its caption (console-only
+    /// diagnostic, mirroring `printReadings` for the text pass). `boxes[i]`
+    /// corresponds to `results[i]`.
+    private static func printFigureCaptions(
+        boxes: [VirtualDocument.PrunedResult.RawBlock],
+        results: [Result<String, Error>]
+    ) {
+        guard !boxes.isEmpty else { return }
+        var captioned = 0, empty = 0, failed = 0
+        var lines: [String] = []
+        for (box, result) in zip(boxes, results) {
+            let b = box.blockBbox
+            let bbox = b.count >= 4
+                ? String(format: "(%.0f,%.0f,%.0f,%.0f)", b[0], b[1], b[2], b[3])
+                : "(?)"
+            let head = "  #\(box.blockId) \(box.blockLabel) bbox=\(bbox) → "
+            switch result {
+            case .success(let caption):
+                if caption.isEmpty {
+                    empty += 1
+                    lines.append(head + "caption: (empty)")
+                } else {
+                    captioned += 1
+                    let oneLine = caption.replacingOccurrences(of: "\n", with: " ")
+                    lines.append(head + "caption: \"\(oneLine)\"")
+                }
+            case .failure(let error):
+                failed += 1
+                lines.append(head + "FAILED: \(error.localizedDescription)")
+            }
+        }
+        print("[figure-caption] \(boxes.count) figures → \(captioned) captioned, \(empty) empty, \(failed) failed")
+        for line in lines { print(line) }
     }
 
     /// Prints a one-line summary plus one line per box matched to its reading.
@@ -1022,21 +1105,21 @@ nonisolated final class CameraManager:
     /// aspect ratio is preserved and features (text, lines, edges) aren't
     /// stretched.
     ///
-    /// Orientation is locked to the **detected object**, not to how the phone is
-    /// held: `objectOrientedCorners` finds the quad's principal (long) axis and
-    /// labels the corners so the rectified crop comes out with that axis
-    /// vertical. This is why the result no longer rotates when you tilt the
-    /// phone — the old code re-labeled corners by their position in the sensor
-    /// frame, so the crop spun with the device and broke entirely for objects
-    /// sitting near 45° in the frame. The encoded JPEG carries **no** device
-    /// orientation tag (`.up`); any residual 180° / text-up ambiguity is
-    /// resolved downstream by PaddleOCR's document-orientation classifier.
+    /// `uprightCorners` labels the quad's corners off the **object's own axes**
+    /// (tilt-proof — the crop doesn't spin or collapse when the object sits at an
+    /// angle in the sensor frame), while choosing which axis is "up" from the
+    /// **device hold-angle** (`deviceAngle`). So a landscape-framed object stays
+    /// landscape and a portrait one stays portrait — matching the viewfinder —
+    /// instead of always being forced long-axis-vertical, which rotated every
+    /// wide capture 90°. The crop is upright in the user's frame, so the JPEG
+    /// carries no further orientation tag (`.up`).
     ///
     /// `orientation` is used only for the degenerate-quad fallback below, where
     /// there's no object axis to lock onto and a plain full-frame encode (tagged
     /// with the device orientation) is the best we can do.
     private func jpegData(from pixelBuffer: CVPixelBuffer,
                           perspectiveCorrectingTo quad: Quad,
+                          deviceAngle: CGFloat,
                           orientation: UIImage.Orientation) -> Data? {
         let baseImage = CIImage(cvPixelBuffer: pixelBuffer)
         let extent = baseImage.extent
@@ -1052,7 +1135,7 @@ nonisolated final class CameraManager:
                     y: extent.minY + p.y * extent.height)
         }
 
-        guard let c = Self.objectOrientedCorners(pixelPoints) else {
+        guard let c = Self.uprightCorners(pixelPoints, deviceAngle: deviceAngle) else {
             // Degenerate (collinear / zero-area) quad — fall back to a plain
             // encode of the full frame.
             return jpegData(from: pixelBuffer, orientation: orientation)
@@ -1076,24 +1159,28 @@ nonisolated final class CameraManager:
             .jpegData(compressionQuality: 0.9)
     }
 
-    /// Labels a quad's four corners as TL/TR/BR/BL **in the object's own frame**,
-    /// returning indices into `p`. The labeling is invariant to how the phone is
-    /// held, which is what keeps the rectified crop from rotating as the device
-    /// tilts/rolls.
+    /// Labels a quad's four corners as TL/TR/BR/BL, returning indices into `p`.
     ///
-    /// Method: take the quad's principal (long) axis from the second moments of
-    /// its corners, de-rotate the corners so that axis is vertical, then assign
-    /// top/bottom by `y` and left/right by `x` in that canonical frame. Doing
-    /// the assignment after de-rotation sidesteps the classic "order_points"
-    /// (sum/difference) failure, which mislabels — and at exactly 45° collapses —
-    /// once a quad is rotated more than 45° in the frame.
+    /// Two jobs, kept separate:
+    ///   * **Tilt-proof labeling** — de-rotate the corners onto the quad's own
+    ///     principal axes (from the second moments) so it's axis-aligned before
+    ///     the min/max split. This sidesteps the classic "order_points" failure,
+    ///     which mislabels — and at 45° collapses — once a quad is rotated in the
+    ///     frame, so the crop never spins or breaks as the object tilts.
+    ///   * **Which way is up** — pick the object axis nearest the *device* "up"
+    ///     (`deviceAngle`, the same hold-angle that orients the full-frame photo)
+    ///     and make that vertical: a portrait-framed object keeps its long axis
+    ///     vertical, a landscape-framed object keeps its long axis horizontal.
     ///
-    /// A rectangle's long axis doesn't say which end is "up"; that 180° choice
-    /// is resolved (via `rho` below) toward the right-side-up branch for normal
-    /// document capture, since the OCR backend no longer re-orients the image.
-    /// Returns nil for a degenerate (zero-area) quad.
-    private static func objectOrientedCorners(
-        _ p: [CGPoint]
+    /// This is the fix for wide captures coming out rotated 90°: the previous
+    /// version always forced the long axis vertical, so every landscape object
+    /// was rectified into a portrait crop. Steering the up-axis by the hold
+    /// direction makes the crop match the viewfinder. Past ~45° of tilt the two
+    /// axes swap which is nearer "up" — orientation is genuinely ambiguous there
+    /// and snaps to the nearer axis. Returns nil for a degenerate (zero-area) quad.
+    private static func uprightCorners(
+        _ p: [CGPoint],
+        deviceAngle: CGFloat
     ) -> (tl: Int, tr: Int, br: Int, bl: Int)? {
         guard p.count == 4 else { return nil }
 
@@ -1108,21 +1195,34 @@ nonisolated final class CameraManager:
         let cx = p.map(\.x).reduce(0, +) / 4
         let cy = p.map(\.y).reduce(0, +) / 4
 
-        // Second moments of the corners about the centroid -> principal angle.
+        // Second moments of the corners about the centroid -> a principal axis.
         var sxx = 0.0, syy = 0.0, sxy = 0.0
         for q in p {
             let dx = Double(q.x - cx), dy = Double(q.y - cy)
             sxx += dx * dx; syy += dy * dy; sxy += dx * dy
         }
-        let theta = 0.5 * atan2(2 * sxy, sxx - syy)   // long-axis angle
-        // Bring the long axis vertical. It's a line, so there are two ways up;
-        // we use -π/2 (not +π/2) so documents land right-side-up for normal
-        // capture. The OCR backend no longer returns a re-oriented image, so
-        // this branch choice is final — the +π/2 branch comes out upside down.
-        let rho = -Double.pi / 2 - theta
+        let theta = 0.5 * atan2(2 * sxy, sxx - syy)
+
+        // Device "up" expressed in the sensor frame. The full-frame path applies
+        // this same hold-angle as an EXIF tag (see uiImageOrientation(for:)); the
+        // crop steers toward it instead. Sensor native is landscape-left, so
+        // angle 0 puts device-up at +y.
+        let a = Double(deviceAngle) * Double.pi / 180
+        let phiUp = atan2(cos(a), -sin(a))
+
+        // Of the quad's four axis directions, the one closest to device-up
+        // becomes the crop's "up". Long axis nearest up -> portrait crop; short
+        // axis nearest up -> landscape crop.
+        var alpha = theta, best = Double.greatestFiniteMagnitude
+        for k in 0..<4 {
+            let cand = theta + Double(k) * Double.pi / 2
+            let d = abs(atan2(sin(cand - phiUp), cos(cand - phiUp)))   // wrapped distance
+            if d < best { best = d; alpha = cand }
+        }
+        let rho = Double.pi / 2 - alpha
         let cosR = CGFloat(cos(rho)), sinR = CGFloat(sin(rho))
 
-        // De-rotate corners about the centroid into the canonical frame, where
+        // De-rotate corners about the centroid into that canonical frame, where
         // the quad is axis-aligned and a plain min/max split is unambiguous.
         let r = p.map { q -> CGPoint in
             let dx = q.x - cx, dy = q.y - cy

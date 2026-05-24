@@ -16,6 +16,7 @@
 
 import SwiftUI
 import Foundation
+import UIKit
 
 struct AnalysisView: View {
     let document: VirtualDocument
@@ -25,6 +26,14 @@ struct AnalysisView: View {
 
     @State private var drilldown: Drilldown?
     @State private var mounted = false
+    /// Briefly true while returning from a drill-in, holding the detection boxes
+    /// out of VoiceOver so focus lands back on the Recapture bar (see
+    /// `returnFocusToRecapture`) rather than diving into the boxes.
+    @State private var stageHiddenFromVoiceOver = false
+    // The staggered box reveal is visual only (see `animatesEntry`); Reduce
+    // Motion turns it off. It now plays under VoiceOver too — that stays
+    // accessibility-safe, see `animatesEntry`.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack {
@@ -36,12 +45,20 @@ struct AnalysisView: View {
                     accessibilityHint: "Discards this scan and returns to the camera",
                     action: onRecapture
                 )
+                // Held out of VoiceOver as the result appears so focus lands on
+                // the first detected region, not this Recapture bar (restored
+                // shortly after so swiping up still reaches it).
+                .voiceOverDeferredEntry()
                 stage
+                    // Held out of VoiceOver only while returning from a drill-in,
+                    // so focus lands back on Recapture above rather than diving
+                    // into the boxes (see the cover's onDismiss).
+                    .accessibilityHidden(stageHiddenFromVoiceOver)
             }
         }
         .opacity(mounted ? 1 : 0)
         .onAppear { withAnimation(.easeOut(duration: 0.32)) { mounted = true } }
-        .fullScreenCover(item: $drilldown) { item in
+        .fullScreenCover(item: $drilldown, onDismiss: returnFocusToRecapture) { item in
             switch item {
             case .reading(let target):
                 ChunkDetailScreen(
@@ -55,6 +72,21 @@ struct AnalysisView: View {
         }
     }
 
+    /// Returning from a drill-in (sentence reader / website summary): send
+    /// VoiceOver to the Recapture bar, not back into the detection boxes. The
+    /// boxes are briefly held out of VoiceOver so the screen-changed focus lands
+    /// on Recapture (the first element left), then restored so swiping reaches
+    /// them again.
+    private func returnFocusToRecapture() {
+        stageHiddenFromVoiceOver = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            UIAccessibility.post(notification: .screenChanged, argument: nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            stageHiddenFromVoiceOver = false
+        }
+    }
+
     // MARK: - Photo + detection overlay
 
     private var stage: some View {
@@ -62,26 +94,30 @@ struct AnalysisView: View {
             let fitted = fittedImageRect(in: geo.size)
             let matches = figureQRMatches
             ZStack(alignment: .topLeading) {
-                Image(uiImage: document.image)
-                    .resizable()
-                    .scaledToFit()
+                // The analyzed photo is a backdrop only; the detection boxes
+                // layered on top are the tap targets. `InertPhoto` draws it as a
+                // UIKit image view with touch *and* accessibility off, so the
+                // user can't reach it under any input — VoiceOver included.
+                // (`.allowsHitTesting(false)` alone never stopped VoiceOver: it
+                // walks the accessibility tree, not the touch hit-test path.)
+                // Aspect-fit, so it stays aligned with the boxes drawn over
+                // `fittedImageRect`.
+                InertPhoto(image: document.image)
                     .frame(width: geo.size.width, height: geo.size.height)
-                    // The analyzed photo is a backdrop only; the detection
-                    // boxes layered on top are the tap targets. allowsHitTesting
-                    // stops touches, but VoiceOver hit-tests the accessibility
-                    // tree separately — so accessibilityHidden is what actually
-                    // keeps VoiceOver from landing on the image. Same "inert"
-                    // pairing the context boxes below use.
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
 
                 // Every detected region, drawn as its true (possibly slanted)
                 // polygon. Interactive ones sit on top so their taps win.
-                ForEach(document.parts) { part in
-                    partBox(part, absorbingQR: matches.figureToQR[part.id], in: fitted)
+                // Sort priority orders VoiceOver by document order (parts first,
+                // index 0 highest) so focus opens on the first detected region
+                // and swiping walks them in reading order — not by where they
+                // happen to sit on screen. Standalone QR codes come after.
+                ForEach(Array(document.parts.enumerated()), id: \.element.id) { index, part in
+                    partBox(part, absorbingQR: matches.figureToQR[part.id], in: fitted, containerHeight: geo.size.height)
+                        .accessibilitySortPriority(Double(document.parts.count - index))
                 }
                 ForEach(qrCodes.filter { !matches.absorbed.contains($0.id) }) { qr in
-                    qrBox(qr, in: fitted)
+                    qrBox(qr, in: fitted, containerHeight: geo.size.height)
+                        .accessibilitySortPriority(-1)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -99,13 +135,16 @@ struct AnalysisView: View {
     }
 
     @ViewBuilder
-    private func partBox(_ part: VirtualDocument.Part, absorbingQR: DetectedQRCode?, in fitted: CGRect) -> some View {
+    private func partBox(_ part: VirtualDocument.Part, absorbingQR: DetectedQRCode?, in fitted: CGRect, containerHeight: CGFloat) -> some View {
         let screen = screenPoints(quad(for: part), in: fitted)
         let bounds = Self.bounds(of: screen)
         if bounds.width >= 2, bounds.height >= 2 {
             let rel = screen.map { CGPoint(x: $0.x - bounds.minX, y: $0.y - bounds.minY) }
             let palette = colors(for: part)
             let shape = PolygonShape(points: rel)
+            // Where this box sits down the photo (0 top → 1 bottom), so it
+            // reveals in turn from the top. See `entryAnimation`.
+            let entryFraction = containerHeight > 0 ? bounds.midY / containerHeight : 0
 
             if let qr = absorbingQR {
                 // This figure is (mostly) a QR code — the QR detector and the
@@ -124,6 +163,7 @@ struct AnalysisView: View {
                     .contentShape(shape)
                 }
                 .buttonStyle(.plain)
+                .staggeredBoxEntry(shown: boxesShown, animation: entryAnimation(verticalFraction: entryFraction))
                 .position(x: bounds.midX, y: bounds.midY)
                 .accessibilityLabel("QR code linking to \(qr.url.host ?? "a website")")
                 .accessibilityHint("Double tap to open a summary of the linked website")
@@ -153,6 +193,7 @@ struct AnalysisView: View {
                     .contentShape(shape)
                 }
                 .buttonStyle(.plain)
+                .staggeredBoxEntry(shown: boxesShown, animation: entryAnimation(verticalFraction: entryFraction))
                 .position(x: bounds.midX, y: bounds.midY)
                 .accessibilityLabel(part.content)
                 .accessibilityHint(hint)
@@ -163,6 +204,7 @@ struct AnalysisView: View {
                     shape.stroke(palette.stroke, lineWidth: 1.5)
                 }
                 .frame(width: bounds.width, height: bounds.height)
+                .staggeredBoxEntry(shown: boxesShown, animation: entryAnimation(verticalFraction: entryFraction))
                 .position(x: bounds.midX, y: bounds.midY)
                 // Not a drill-in target (single sentence / title / figure), but
                 // still a VoiceOver element that speaks its text — so a blind
@@ -180,10 +222,12 @@ struct AnalysisView: View {
     }
 
     @ViewBuilder
-    private func qrBox(_ qr: DetectedQRCode, in fitted: CGRect) -> some View {
+    private func qrBox(_ qr: DetectedQRCode, in fitted: CGRect, containerHeight: CGFloat) -> some View {
         let r = screenRect(for: qr.pageRect, in: fitted)
         if r.width >= 2, r.height >= 2 {
             let stroke = LarpTheme.orange
+            // Reveals in vertical order alongside the detection boxes.
+            let entryFraction = containerHeight > 0 ? r.midY / containerHeight : 0
             Button {
                 drilldown = .summary(qr)
             } label: {
@@ -196,6 +240,7 @@ struct AnalysisView: View {
             }
             .buttonStyle(.plain)
             .frame(width: r.width, height: r.height)
+            .staggeredBoxEntry(shown: boxesShown, animation: entryAnimation(verticalFraction: entryFraction))
             .position(x: r.midX, y: r.midY)
             .accessibilityLabel("QR code linking to \(qr.url.host ?? "a website")")
             .accessibilityHint("Double tap to open a summary of the linked website")
@@ -222,6 +267,36 @@ struct AnalysisView: View {
         .frame(height: 18)
         .background(color)
         .accessibilityHidden(true)
+    }
+
+    // MARK: - Entry animation
+
+    /// Whether the top-to-bottom box reveal should play — suppressed only under
+    /// **Reduce Motion** (boxes just appear, no scale/fade).
+    ///
+    /// It DOES run with VoiceOver on, and stays accessibility-safe: the reveal is
+    /// a one-shot that settles in ~1s (no `repeatForever` churn to disturb
+    /// VoiceOver), and a SwiftUI view at `.opacity(0)` stays IN the accessibility
+    /// tree — so every region is present and focusable from the first frame,
+    /// ordered by `accessibilitySortPriority`, with `voiceOverDeferredEntry`
+    /// landing focus on the first one. The boxes only *look* like they fade in;
+    /// their accessibility never blinks in or out.
+    private var animatesEntry: Bool { !reduceMotion }
+
+    /// A box's "fully revealed" state. Always true when we're not animating, so
+    /// boxes never start hidden for Reduce-Motion users.
+    private var boxesShown: Bool { !animatesEntry || mounted }
+
+    /// Fade-and-scale-up for one box, delayed by how far down the photo it sits
+    /// (`verticalFraction`: 0 top → 1 bottom) so regions reveal top-to-bottom —
+    /// the mockup's `chunk-pop`, ordered by real position rather than list index.
+    /// Returns nil (no implicit animation, so the box just snaps to shown) when
+    /// entry is suppressed.
+    private func entryAnimation(verticalFraction: CGFloat) -> Animation? {
+        guard animatesEntry else { return nil }
+        let f = min(max(verticalFraction, 0), 1)
+        let delay = 0.12 + Double(f) * 0.55   // top leads, bottom trails
+        return .timingCurve(0.2, 0, 0, 1, duration: 0.42).delay(delay)
     }
 
     // MARK: - Geometry
@@ -347,8 +422,14 @@ struct AnalysisView: View {
         return !part.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// A figure is any image part — image / header_image / footer_image plus
+    /// charts and seals (see `VirtualDocument.figureLabels`). Checking the Part
+    /// case rather than the label keeps this in lockstep with `Part.from`'s
+    /// routing, so a chart counts as a non-interactive figure with a spoken
+    /// caption, not a text drill-in.
     private func isFigure(_ part: VirtualDocument.Part) -> Bool {
-        VirtualDocument.imageLabels.contains(part.label)
+        if case .image = part { return true }
+        return false
     }
 
     /// Pairs each QR code with a figure it (mostly) fills, so a QR that the
@@ -436,6 +517,22 @@ private struct PolygonShape: Shape {
     }
 }
 
+// MARK: - Box entry
+
+private extension View {
+    /// Drives one detection box's entry: invisible + slightly contracted →
+    /// full size and opaque, using the supplied (usually delayed) animation.
+    /// Applied *before* the caller's `.position`, so the box scales about its
+    /// own center at its final spot. With `animation == nil` the box snaps to
+    /// shown with no motion — the VoiceOver / Reduce-Motion path.
+    func staggeredBoxEntry(shown: Bool, animation: Animation?) -> some View {
+        self
+            .scaleEffect(shown ? 1 : 0.94)
+            .opacity(shown ? 1 : 0)
+            .animation(animation, value: shown)
+    }
+}
+
 // MARK: - Drilldown
 
 /// A region the user drilled into from the analysis screen — a text block's
@@ -474,6 +571,10 @@ struct ChunkDetailScreen: View {
     let sentences: [String]
     let onDone: () -> Void
 
+    /// Anchors VoiceOver focus on the first sentence / lone type card; set true
+    /// once the cover settles (see `onAppear`) to move focus there.
+    @AccessibilityFocusState private var readerFocused: Bool
+
     var body: some View {
         ZStack {
             LarpTheme.bg0.ignoresSafeArea()
@@ -483,13 +584,42 @@ struct ChunkDetailScreen: View {
                     accessibilityHint: "Closes the reader and returns to the document",
                     action: onDone
                 )
+                .voiceOverDeferredEntry()
                 // The block type ("Title" / "Text" …) rides at the BOTTOM of the
                 // list, after every sentence, so a blind user reads the block
-                // then learns what kind of block it was. `focusOnAppear` lands
-                // VoiceOver on the first sentence (or the type card, when a
-                // single-sentence block collapses to just it) rather than the
-                // Back bar above.
-                SentenceListView(sentences: sentences, accent: accent, typeFooter: title, focusOnAppear: true)
+                // then learns what kind of block it was. `leadsFocus` ranks those
+                // cards above the Back bar in VoiceOver order; `entryFocus` is the
+                // anchor the move below lands on — the first sentence (or the lone
+                // type card), not "Back to scan"; the bar is reached by swiping on.
+                SentenceListView(
+                    sentences: sentences,
+                    accent: accent,
+                    typeFooter: title,
+                    leadsFocus: true,
+                    entryFocus: $readerFocused
+                )
+            }
+        }
+        // A fullScreenCover does NOT hand VoiceOver focus to its content on its
+        // own, and re-posting `.screenChanged` after it's already presented is a
+        // no-op (no real screen change) — which is why the earlier attempts moved
+        // nothing. So once the present animation settles, move focus EXPLICITLY
+        // onto the first card via its `@AccessibilityFocusState` anchor. 0.4s
+        // clears the present animation; tune if it fires too early/late.
+        .onAppear {
+            // DIAGNOSTIC: three different focus mechanisms have moved nothing,
+            // which usually means this code isn't running on the build under test
+            // rather than three wrong APIs. Speak an audible marker we can listen
+            // for to confirm the path runs, THEN move focus onto the first card.
+            // The move is retried because a single early set can be overridden by
+            // VoiceOver's own initial focus pass once the cover finishes presenting.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                UIAccessibility.post(notification: .announcement, argument: "Reader ready")
+            }
+            for delay in [0.6, 1.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    readerFocused = true
+                }
             }
         }
     }

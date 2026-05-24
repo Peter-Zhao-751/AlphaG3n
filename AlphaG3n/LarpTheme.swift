@@ -14,6 +14,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 // MARK: - Color tokens
 
@@ -241,5 +242,79 @@ struct LarpHintLine: View {
         }
         .accessibilityHidden(!spoken)
         .accessibilityLabel(spoken ? text : "")
+    }
+}
+
+// MARK: - Deferred VoiceOver entry
+
+extension View {
+    /// Withholds this chrome (a Back bar / Close button) from VoiceOver for a
+    /// brief window after it appears, so a new screen's *initial* VoiceOver focus
+    /// skips it and lands on the screen's content. Without this, focus defaults
+    /// to the first element — this top bar — and a programmatic focus move can
+    /// only yank it away *after* VoiceOver has already begun half-speaking the
+    /// bar's label. The view stays fully visible on screen the whole time; only
+    /// its accessibility element is held back, then restored so swipe navigation
+    /// can still reach it. Runs once per appearance.
+    func voiceOverDeferredEntry(restoreAfter seconds: Double = 1.2) -> some View {
+        modifier(VoiceOverDeferredEntry(restoreAfter: seconds))
+    }
+}
+
+private struct VoiceOverDeferredEntry: ViewModifier {
+    let restoreAfter: Double
+    @State private var hidden = true
+    @State private var armed = false
+
+    func body(content: Content) -> some View {
+        content
+            .accessibilityHidden(hidden)
+            .onAppear {
+                // Guard so returning to this screen (e.g. dismissing a cover
+                // presented above it) doesn't re-hide the bar and disturb focus.
+                guard !armed else { return }
+                armed = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + restoreAfter) {
+                    hidden = false
+                }
+            }
+    }
+}
+
+// MARK: - Inert photo backdrop
+
+/// Draws a captured `UIImage` as a purely decorative backdrop that the user can
+/// never reach — by touch or by VoiceOver. VoiceOver walks the *accessibility
+/// tree*, not the touch hit-test path, so SwiftUI's `.allowsHitTesting(false)`
+/// alone never kept it off the photo, and `.accessibilityHidden(true)` on a
+/// full-screen `Image(uiImage:)` didn't reliably remove it either. Rendering
+/// through a UIKit `UIImageView` and turning interaction *and* accessibility off
+/// at the UIKit layer (`isUserInteractionEnabled` / `isAccessibilityElement` /
+/// `accessibilityElementsHidden`) makes the photo definitively inert — the same
+/// escape hatch `ScanLineUIView`/`DotUIView` use for their decorative motion.
+/// Mirrors `Image().resizable().scaledToFit()`: aspect-fit, letterboxed, centred,
+/// so any overlay aligned to the fitted rect still lands on the right pixels.
+struct InertPhoto: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView(image: image)
+        view.contentMode = .scaleAspectFit
+        // Inert at the UIKit layer: no touches, and out of the accessibility
+        // tree entirely (so VoiceOver can't focus or activate it).
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        // Fill the SwiftUI frame rather than imposing the image's intrinsic
+        // size; `.scaleAspectFit` letterboxes the picture within those bounds.
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        uiView.image = image
     }
 }

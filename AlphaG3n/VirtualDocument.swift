@@ -108,12 +108,14 @@ public extension VirtualDocument {
             }
         }
 
-        /// Transcribed text for text parts; empty for image parts. The renderer
-        /// draws this centered in the box when the label is a readable-text type.
+        /// Transcribed text for text parts; the concise figure caption for image
+        /// parts (empty when none was produced). The renderer draws this centered
+        /// in the box for readable-text labels only — figure captions are spoken
+        /// via VoiceOver, not painted onto the overlay.
         public var content: String {
             switch self {
             case .text(let p):  return p.content
-            case .image:        return ""
+            case .image(let p): return p.description
             }
         }
     }
@@ -158,6 +160,10 @@ public extension VirtualDocument {
         /// (e.g. `imgs/img_in_image_box_2300_1828_2879_2438.jpg`), parsed
         /// out of the block's markdown `<img src="…">` snippet.
         public let extractedImageRef: String?
+        /// Concise, low-detail caption from `OpenAIClient.describeFigures`, used
+        /// as the figure's spoken VoiceOver label. Empty when captioning was
+        /// skipped or failed; callers fall back to the block's type name.
+        public let description: String
 
         public init(
             id: Int,
@@ -165,7 +171,8 @@ public extension VirtualDocument {
             bbox: CGRect,
             polygon: [CGPoint],
             order: Int?,
-            extractedImageRef: String?
+            extractedImageRef: String?,
+            description: String = ""
         ) {
             self.id = id
             self.label = label
@@ -173,6 +180,7 @@ public extension VirtualDocument {
             self.polygon = polygon
             self.order = order
             self.extractedImageRef = extractedImageRef
+            self.description = description
         }
     }
 }
@@ -201,6 +209,14 @@ public extension VirtualDocument {
             /// `LayoutAugmentation.extraBlocks` sets it `true`.
             public var isFromCraft: Bool = false
 
+            /// Concise figure caption from `OpenAIClient.describeFigures`, spliced
+            /// in by the OCR pass for graphics blocks (see `VirtualDocument.figureLabels`).
+            /// Like `isFromCraft`, it's deliberately absent from `CodingKeys` — the
+            /// API never sends it — and defaults to `nil`. Surfaced only through
+            /// `ImagePart`, never from raw `blockContent`, so Baidu's `<img>`
+            /// markdown can't leak into the spoken label.
+            public var figureDescription: String? = nil
+
             public init(
                 blockLabel: String,
                 blockContent: String,
@@ -209,7 +225,8 @@ public extension VirtualDocument {
                 blockOrder: Int?,
                 groupId: Int,
                 blockPolygonPoints: [[Double]]?,
-                isFromCraft: Bool = false
+                isFromCraft: Bool = false,
+                figureDescription: String? = nil
             ) {
                 self.blockLabel = blockLabel
                 self.blockContent = blockContent
@@ -219,6 +236,7 @@ public extension VirtualDocument {
                 self.groupId = groupId
                 self.blockPolygonPoints = blockPolygonPoints
                 self.isFromCraft = isFromCraft
+                self.figureDescription = figureDescription
             }
 
             enum CodingKeys: String, CodingKey {
@@ -242,8 +260,18 @@ public extension VirtualDocument {
                     blockOrder: blockOrder,
                     groupId: groupId,
                     blockPolygonPoints: blockPolygonPoints,
-                    isFromCraft: isFromCraft
+                    isFromCraft: isFromCraft,
+                    figureDescription: figureDescription
                 )
+            }
+
+            /// Copy of this block carrying a concise figure caption (see
+            /// `figureDescription`) — used to splice an `OpenAIClient.describeFigures`
+            /// result into a graphics block before rendering.
+            func settingFigureDescription(_ description: String) -> RawBlock {
+                var copy = self
+                copy.figureDescription = description
+                return copy
             }
         }
 
@@ -266,6 +294,12 @@ public extension VirtualDocument {
 public extension VirtualDocument {
 
     static let imageLabels: Set<BlockLabel> = [.image, .footerImage, .headerImage]
+
+    /// Graphics regions captioned by a concise figure description rather than
+    /// OCR'd: the `imageLabels` plus charts and seals. Every one of these becomes
+    /// an `ImagePart` (so its raw markdown is dropped, never spoken) and surfaces
+    /// its caption through VoiceOver. Keep in sync with `imageLabels`.
+    static let figureLabels: Set<BlockLabel> = imageLabels.union([.chart, .seal])
 
     /// Labels whose crops carry readable prose worth sending to the OCR reader
     /// and, once read, drawing as centered text. Pure graphics (image /
@@ -321,14 +355,15 @@ private extension VirtualDocument.Part {
             return CGPoint(x: pair[0], y: pair[1])
         }
 
-        if VirtualDocument.imageLabels.contains(label) {
+        if VirtualDocument.figureLabels.contains(label) {
             return .image(.init(
                 id: raw.blockId,
                 label: label,
                 bbox: bbox,
                 polygon: polygon,
                 order: raw.blockOrder,
-                extractedImageRef: extractImageRef(from: raw.blockContent)
+                extractedImageRef: extractImageRef(from: raw.blockContent),
+                description: raw.figureDescription ?? ""
             ))
         }
         return .text(.init(

@@ -26,32 +26,47 @@ struct SentenceListView: View {
     /// card shows — the tapped box already spoke that one line, so the list would
     /// just repeat it. The website summary passes nil (no type, always listed).
     var typeFooter: String? = nil
-    /// When true, VoiceOver focus is pulled onto the first listed element as the
-    /// view appears — the first sentence, or the block-type card when a
-    /// single-sentence block has collapsed to just that. Off by default: the
-    /// website summary leaves it off because its caller focuses the website-name
-    /// hero sitting above this list instead.
-    var focusOnAppear: Bool = false
 
-    /// Drives the appear-time VoiceOver focus (see `focusOnAppear`). Bound to
-    /// every sentence card and the type-footer card so either can be the anchor.
-    @AccessibilityFocusState private var focusedAnchor: FocusAnchor?
+    /// When true, the content cards take VoiceOver sort priority *above* a
+    /// sibling Back bar (`LarpBackBar` = 1), so a fullScreenCover opens focus on
+    /// the first sentence / lone type card instead of defaulting to the top-most,
+    /// higher-priority "Back to scan" bar. The website summary leaves this false
+    /// so its `ReaderHero` (the site name) keeps the initial focus.
+    var leadsFocus: Bool = false
 
-    private enum FocusAnchor: Hashable {
-        case sentence(Int)
-        case footer
-    }
+    /// Optional VoiceOver focus anchor for the screen's *first* card (first
+    /// sentence, or the lone type card). The caller sets its bound value true a
+    /// beat after the cover appears to MOVE focus here — necessary because a
+    /// fullScreenCover doesn't hand VoiceOver focus to its content on its own,
+    /// and a `.screenChanged` re-post is a no-op once the cover is presented.
+    /// nil (the website summary) leaves focus on its own hero.
+    var entryFocus: AccessibilityFocusState<Bool>.Binding? = nil
 
     /// Whether the per-sentence cards are listed. A single-sentence typed block
     /// collapses to just its type card; the website summary (no typeFooter)
     /// always lists its sentence(s), even when there's only one.
     private var listsSentences: Bool { typeFooter == nil || sentences.count > 1 }
 
-    /// The type-footer card is the first focus anchor only when no sentence
-    /// cards sit above it (i.e. the collapsed single-sentence block).
-    private var firstAnchorIsFooter: Bool { !(listsSentences && !sentences.isEmpty) }
+    /// VoiceOver order for the content cards. With `leadsFocus` set, returns a
+    /// descending priority that sits above `LarpBackBar`'s 1 (last content card
+    /// = 2), so the first card opens focus and the Back bar falls to the end of
+    /// the swipe order — mirroring how `AnalysisView` ranks its detection boxes
+    /// above the Recapture bar. Returns 0 (the default) when `leadsFocus` is off,
+    /// leaving the website summary's hero-first order untouched. `position` is the
+    /// card's index in the rendered list (sentences first, then the type footer).
+    private func sortPriority(at position: Int) -> Double {
+        guard leadsFocus else { return 0 }
+        let total = (listsSentences ? sentences.count : 0) + (typeFooter != nil ? 1 : 0)
+        return Double(total - position + 1)
+    }
 
     var body: some View {
+        // VoiceOver entry focus takes two things together: `leadsFocus` sort
+        // priority sets the ORDER (cards above the caller's Back bar), and
+        // `entryFocus` actually MOVES focus onto the first card a beat after the
+        // cover appears. Sort priority alone doesn't move focus into a
+        // fullScreenCover, so the move is what makes the first sentence / lone
+        // type card the spoken element instead of "Back to scan".
         VStack(spacing: 0) {
             if listsSentences { listHead }
             ScrollView {
@@ -59,27 +74,19 @@ struct SentenceListView: View {
                     if listsSentences {
                         ForEach(Array(sentences.enumerated()), id: \.offset) { index, sentence in
                             card(index: index, sentence: sentence)
-                                .accessibilityFocused($focusedAnchor, equals: .sentence(index))
+                                .accessibilitySortPriority(sortPriority(at: index))
+                                .accessibilityEntryFocus(index == 0 ? entryFocus : nil)
                         }
                     }
                     if let typeFooter {
                         typeFooterCard(typeFooter)
-                            .accessibilityFocused($focusedAnchor, equals: .footer)
+                            .accessibilitySortPriority(sortPriority(at: listsSentences ? sentences.count : 0))
+                            .accessibilityEntryFocus(listsSentences ? nil : entryFocus)
                     }
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, listsSentences ? 4 : 12)
                 .padding(.bottom, 40)
-            }
-        }
-        // VoiceOver otherwise lands on the Back bar above (it carries a higher
-        // sort priority); pull focus onto the first sentence (or the type card,
-        // for a collapsed single-sentence block) instead. The brief delay lets
-        // the cover settle first — the same timing the website summary uses.
-        .onAppear {
-            guard focusOnAppear else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                focusedAnchor = firstAnchorIsFooter ? .footer : .sentence(0)
             }
         }
     }
@@ -148,7 +155,22 @@ struct SentenceListView: View {
         )
         .padding(.top, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Block type: \(type)")
+        // Speak just the type ("Text", "Title", …) — not "Block type: Text".
+        .accessibilityLabel(type)
+    }
+}
+
+private extension View {
+    /// Applies an `@AccessibilityFocusState` anchor only when one is supplied,
+    /// so callers that don't drive entry focus (the website summary) stay
+    /// untouched. Setting the bound value true moves VoiceOver focus here.
+    @ViewBuilder
+    func accessibilityEntryFocus(_ binding: AccessibilityFocusState<Bool>.Binding?) -> some View {
+        if let binding {
+            accessibilityFocused(binding)
+        } else {
+            self
+        }
     }
 }
 

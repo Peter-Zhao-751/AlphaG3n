@@ -259,6 +259,25 @@ public struct OpenAIClient: Sendable {
     Keep any `note` to one short spoken sentence.
     """
 
+    /// System prompt for `describeFigures(in:)`. Produces a single very short,
+    /// low-detail caption of a figure (photo / illustration / chart / diagram /
+    /// seal) for a listener who can't see it. Deliberately refuses to read any
+    /// text inside the figure: that text is captured by the OCR pass over the
+    /// other blocks, so transcribing it here would only duplicate it — and the
+    /// same characters are often cross-detected as their own text block.
+    public static let describeFigureSystemPrompt = """
+    You caption a single figure — a photo, illustration, chart, diagram, or \
+    seal — for a listener who cannot see it. Reply with ONE short, plain phrase: \
+    what the figure is and its overall gist, nothing more. Be very concise and \
+    low-detail.
+
+    Do NOT read, transcribe, quote, or list any text, labels, numbers, axis \
+    values, or captions inside the figure. That text is captured separately, so \
+    repeating it here would duplicate it. Describe only the visual; ignore the words.
+
+    If the crop is blank or not a real figure, say so briefly.
+    """
+
     /// Fires one Responses request per image **concurrently** (at most
     /// `maxConcurrent` in flight) and returns one result per image, IN INPUT
     /// ORDER. A single image's failure is captured as `.failure(...)` and never
@@ -337,6 +356,32 @@ public struct OpenAIClient: Sendable {
                 }
             }
         }
+    }
+
+    /// Concurrent figure-captioning companion to `readText(in:)`: uploads each
+    /// figure crop with the concise `describeFigureSystemPrompt` and returns, per
+    /// image and IN ORDER, a short plain-text caption (trimmed). Forces free-form
+    /// text, drops the image `detail` to `.low` (a gist caption needs no fine
+    /// resolution, and this keeps it cheap and fast), and uses minimal reasoning.
+    /// The caller can override any of these by setting them before the call.
+    /// Unlike `readText`, there's no structured triage — a blank or non-figure
+    /// crop just comes back as a brief note the caller can keep or ignore. Does
+    /// not throw; a single image's failure is captured as `.failure(...)`.
+    public func describeFigures(in images: [Data],
+                                maxConcurrent: Int = 5,
+                                session: URLSession = .shared) async -> [Result<String, Error>] {
+        var captioner = self
+        captioner.responseFormat = .text
+        captioner.imageDetail = .low
+        // A gist caption isn't a reasoning task — minimal effort is much faster.
+        if captioner.reasoningEffort == nil { captioner.reasoningEffort = .minimal }
+        let raw = await captioner.visionBatch(
+            system: Self.describeFigureSystemPrompt,
+            user: "Describe this figure very concisely.",
+            images: images,
+            maxConcurrent: maxConcurrent,
+            session: session)
+        return raw.map { $0.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } }
     }
 
     /// One image's reading: the transcription plus a flag describing whether the

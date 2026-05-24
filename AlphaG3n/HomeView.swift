@@ -19,6 +19,7 @@ struct HomeView: View {
     @State private var zooming = false
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
 
     /// Faint constellation of pixel squares behind the logo. Fixed at init so
     /// they don't jump on every redraw.
@@ -64,7 +65,7 @@ struct HomeView: View {
             HStack(spacing: 10) {
                 Text("LARP")
                 Rectangle().fill(LarpTheme.orange).frame(width: 6, height: 6)
-                Text("v0.4")
+                Text("v0.410.4")
             }
             .font(LarpTheme.mono(11))
             .tracking(3)
@@ -111,8 +112,15 @@ struct HomeView: View {
                     .frame(width: 8, height: 8)
                     .opacity(pulse ? 1 : 0.35)
                     .scaleEffect(pulse ? 1.3 : 1)
+                    // Gate the looping pulse on VoiceOver as well as Reduce
+                    // Motion. A repeatForever animation never lets the view tree
+                    // settle, and iOS reacts by re-announcing the focused "LARP"
+                    // button on a loop — so a VoiceOver user (who usually has no
+                    // Reduce Motion) just hears "LARP… LARP…" every few seconds.
+                    // accessibilityHidden on this dot doesn't help; the animation
+                    // still churns. Mirrors AnalysisView's `animatesEntry` guard.
                     .animation(
-                        reduceMotion ? nil : .easeInOut(duration: 1.4).repeatForever(autoreverses: true),
+                        (reduceMotion || voiceOverEnabled) ? nil : .easeInOut(duration: 1.4).repeatForever(autoreverses: true),
                         value: pulse
                     )
                 Text("TAP LOGO TO BEGIN")
